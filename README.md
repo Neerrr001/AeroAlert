@@ -1,0 +1,1 @@
+AeroAlert- An anomaly detecting intelligence to distinguish between 'unusual but physically coherent' & 'unusual + internally inconsistent' signals 
