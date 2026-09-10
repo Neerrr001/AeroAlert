@@ -74,4 +74,51 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
         .std()
     )
 
+
+        # ---------------------------------------------------------
+    # 4. Absolute changes
+    # ---------------------------------------------------------
+
+    df["temperature_abs_change"] = (
+        df["temperature_change"].abs()
+    )
+
+    df["pressure_abs_change"] = (
+        df["pressure_change"].abs()
+    )
+
+    df["humidity_abs_change"] = (
+        df["humidity_change"].abs()
+    )
+
+
+    # ---------------------------------------------------------
+    # 5. Deviation from recent mean
+    # ---------------------------------------------------------
+
+    df["temperature_deviation"] = (
+        df["temperature"]
+        - df["temperature_rolling_mean"]
+    )
+
+    df["pressure_deviation"] = (
+        df["pressure"]
+        - df["pressure_rolling_mean"]
+    )
+
+    df["humidity_deviation"] = (
+        df["humidity"]
+        - df["humidity_rolling_mean"]
+    )
+
+
+    # ---------------------------------------------------------
+    # 6. Environmental movement
+    # ---------------------------------------------------------
+
+    df["environmental_change"] = (
+        df["pressure_abs_change"].fillna(0)
+        + df["humidity_abs_change"].fillna(0)
+    )
+
     return df
