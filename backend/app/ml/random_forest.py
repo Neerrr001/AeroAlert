@@ -1,5 +1,6 @@
 import pandas as pd
-from sklearn.ensemble import IsolationForest
+
+from sklearn.ensemble import RandomForestClassifier
 
 
 FEATURE_COLUMNS = [
@@ -31,26 +32,27 @@ FEATURE_COLUMNS = [
 ]
 
 
-def train_isolation_forest(
-    df: pd.DataFrame,
-    contamination: float = 0.01
-):
+def train_random_forest(
+    X_train: pd.DataFrame,
+    y_train: pd.Series
+) -> RandomForestClassifier:
+    """
+    Train a Random Forest classifier for AeroAlert.
 
-    training_data = df.dropna(
-        subset=FEATURE_COLUMNS
-    )
+    Each row represents a weather-sensor observation,
+    while y_train contains the known anomaly class.
+    """
 
-    X_train = training_data[FEATURE_COLUMNS]
-
-    print(f"Training rows: {len(X_train)}")
-
-    model = IsolationForest(
-        n_estimators=200,
-        contamination=contamination,
+    model = RandomForestClassifier(
+        n_estimators=300,
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
+        class_weight="balanced"
     )
 
-    model.fit(X_train)
+    model.fit(
+        X_train,
+        y_train
+    )
 
     return model
