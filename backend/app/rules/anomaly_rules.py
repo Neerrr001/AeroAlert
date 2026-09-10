@@ -17,19 +17,45 @@ def detect_spike(
 
 def detect_frozen_sensor(
     temperatures: pd.Series,
-    window: int = 6
+    pressures: pd.Series,
+    humidities: pd.Series,
+    window: int = 6,
+    environmental_change_threshold: float = 1.0
 ) -> bool:
-    """
-    Detect whether the sensor reported exactly
-    the same temperature for several consecutive readings.
-    """
 
     if len(temperatures) < window:
         return False
 
-    recent = temperatures.tail(window)
+    recent_temp = temperatures.iloc[-window:]
+    recent_pressure = pressures.iloc[-window:]
+    recent_humidity = humidities.iloc[-window:]
 
-    return recent.nunique() == 1
+    if recent_temp.isna().any():
+        return False
+
+    # Temperature hasn't changed
+    temperature_frozen = recent_temp.nunique() == 1
+
+    if not temperature_frozen:
+        return False
+
+    # Other sensors are changing
+    pressure_change = (
+        recent_pressure.max()
+        - recent_pressure.min()
+    )
+
+    humidity_change = (
+        recent_humidity.max()
+        - recent_humidity.min()
+    )
+
+    environmental_change = max(
+        pressure_change,
+        humidity_change
+    )
+
+    return environmental_change >= environmental_change_threshold
 
 
 def detect_missing_data(row: pd.Series) -> bool:
