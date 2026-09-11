@@ -2,7 +2,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -11,13 +11,14 @@ from app.ml.random_forest import FEATURE_COLUMNS, train_random_forest
 from app.services.anomaly_history import AnomalyHistory
 from app.services.anomaly_service import AnomalyService
 from app.services.connection_manager import ConnectionManager
+from app.services.operator_decisions import OperatorDecisionStore
 from app.services.station_history import StationHistory
 
 
 app = FastAPI(
     title="AeroAlert API",
     description="Intelligent anomaly detection for weather stations",
-    version="0.5.0",
+    version="0.6.0",
 )
 
 app.add_middleware(
@@ -37,6 +38,10 @@ class WeatherReading(BaseModel):
     humidity: float | None
 
 
+class OperatorDecision(BaseModel):
+    decision: str
+
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 TRAIN_PATH = BASE_DIR / "data" / "simulated" / "training_data.csv"
 
@@ -45,7 +50,6 @@ training_df = pd.read_csv(TRAIN_PATH)
 training_df["timestamp"] = pd.to_datetime(training_df["timestamp"], utc=True)
 training_df = create_features(training_df)
 ml_data = training_df.dropna(subset=FEATURE_COLUMNS)
-
 X_train = ml_data[FEATURE_COLUMNS]
 y_train = ml_data["anomaly_type"]
 
@@ -53,11 +57,11 @@ print("Training Random Forest...")
 model = train_random_forest(X_train, y_train)
 print("Model ready.")
 
-
 anomaly_service = AnomalyService(model)
 station_history = StationHistory(max_length=48)
 anomaly_history = AnomalyHistory(max_length=100)
 connection_manager = ConnectionManager()
+operator_decisions = OperatorDecisionStore()
 
 
 @app.get("/")
@@ -72,19 +76,18 @@ def health():
         "stations": len(station_history.stations()),
         "websocket_clients": len(connection_manager.active_connections),
         "anomalies": anomaly_history.count(),
+        "operator_decisions": len(operator_decisions.all()),
     }
 
 
 @app.post("/telemetry")
 async def ingest_telemetry(reading: WeatherReading):
     """Ingest one reading, detect anomalies, retain evidence, and broadcast live."""
-
     reading_data = reading.model_dump()
     station_history.add(reading.station_id, reading_data)
     history = station_history.get(reading.station_id)
     result = anomaly_service.detect(pd.DataFrame(history))
 
-    # Keep the latest 12 observations as evidence for the review screen.
     evidence = []
     for context_reading in history[-12:]:
         timestamp = context_reading["timestamp"]
@@ -117,10 +120,7 @@ async def ingest_telemetry(reading: WeatherReading):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, station_id: str | None = None):
-    """Stream telemetry and anomaly results to dashboard clients."""
-
     await connection_manager.connect(websocket, station_id)
-
     try:
         while True:
             await websocket.receive_text()
@@ -132,23 +132,47 @@ async def websocket_endpoint(websocket: WebSocket, station_id: str | None = None
 
 @app.get("/anomalies")
 def get_anomalies(station_id: str | None = None):
-    """Return recent live anomaly decisions, including telemetry evidence."""
-
     anomalies = anomaly_history.get(station_id)
+    enriched = []
+    for anomaly in anomalies:
+        item = dict(anomaly)
+        item["operator_decision"] = operator_decisions.get(
+            anomaly["station_id"], anomaly["timestamp"]
+        )
+        enriched.append(item)
+    return {"count": len(enriched), "anomalies": enriched}
+
+
+@app.post("/anomalies/{station_id}/{timestamp}/decision")
+async def set_operator_decision(
+    station_id: str,
+    timestamp: str,
+    decision: OperatorDecision,
+):
+    try:
+        saved = operator_decisions.set(station_id, timestamp, decision.decision)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    message = {
+        "type": "operator_decision",
+        **saved,
+    }
+    await connection_manager.broadcast(message, station_id)
+    return saved
+
+
+@app.get("/anomalies/{station_id}/{timestamp}/decision")
+def get_operator_decision(station_id: str, timestamp: str):
     return {
-        "count": len(anomalies),
-        "anomalies": anomalies,
+        "decision": operator_decisions.get(station_id, timestamp)
     }
 
 
 @app.get("/telemetry/{station_id}")
 def get_station_history(station_id: str):
     history = station_history.get(station_id)
-    return {
-        "station_id": station_id,
-        "count": len(history),
-        "readings": history,
-    }
+    return {"station_id": station_id, "count": len(history), "readings": history}
 
 
 @app.get("/stations")
@@ -157,10 +181,7 @@ def get_stations():
     return {
         "count": len(stations),
         "stations": [
-            {
-                "station_id": station_id,
-                "history_size": station_history.count(station_id),
-            }
+            {"station_id": station_id, "history_size": station_history.count(station_id)}
             for station_id in stations
         ],
     }
