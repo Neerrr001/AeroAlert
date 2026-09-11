@@ -1,13 +1,15 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
 from datetime import datetime
-
-from app.services.anomaly_service import AnomalyService
-from app.ml.random_forest import FEATURE_COLUMNS, train_random_forest
-from app.ml.feature_engineering import create_features
+from pathlib import Path
 
 import pandas as pd
-from pathlib import Path
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+from app.ml.feature_engineering import create_features
+from app.ml.random_forest import FEATURE_COLUMNS, train_random_forest
+from app.rules.anomaly_rules import detect_missing_data
+from app.services.anomaly_service import AnomalyService
+from app.services.station_history import StationHistory
 
 
 # =========================================================
@@ -17,7 +19,7 @@ from pathlib import Path
 app = FastAPI(
     title="AeroAlert API",
     description="Intelligent anomaly detection for weather stations",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 
@@ -28,9 +30,9 @@ app = FastAPI(
 class WeatherReading(BaseModel):
     timestamp: datetime
     station_id: str
-    temperature: float
-    pressure: float
-    humidity: float
+    temperature: float | None
+    pressure: float | None
+    humidity: float | None
 
 
 # =========================================================
@@ -55,9 +57,7 @@ training_df["timestamp"] = pd.to_datetime(
     utc=True
 )
 
-training_df = create_features(
-    training_df
-)
+training_df = create_features(training_df)
 
 ml_data = training_df.dropna(
     subset=FEATURE_COLUMNS
@@ -77,12 +77,11 @@ print("Model ready.")
 
 
 # =========================================================
-# Create anomaly service
+# Create services
 # =========================================================
 
-anomaly_service = AnomalyService(
-    model
-)
+anomaly_service = AnomalyService(model)
+station_history = StationHistory(max_length=48)
 
 
 # =========================================================
@@ -99,18 +98,88 @@ def root():
 @app.get("/health")
 def health():
     return {
-        "status": "healthy"
+        "status": "healthy",
+        "stations": len(station_history.stations())
     }
 
 
 # =========================================================
-# Detection endpoint
+# Real-time telemetry ingestion
+# =========================================================
+
+@app.post("/telemetry")
+def ingest_telemetry(reading: WeatherReading):
+    """
+    Receive one weather reading, add it to the station's rolling
+    history, and immediately run anomaly detection.
+    """
+
+    reading_data = reading.model_dump()
+
+    station_history.add(
+        reading.station_id,
+        reading_data
+    )
+
+    history = station_history.get(
+        reading.station_id
+    )
+
+    data = pd.DataFrame(history)
+
+    result = anomaly_service.detect(data)
+
+    return {
+        "station_id": reading.station_id,
+        "timestamp": reading.timestamp,
+        "history_size": len(history),
+        "detection": result
+    }
+
+
+# =========================================================
+# Station history
+# =========================================================
+
+@app.get("/telemetry/{station_id}")
+def get_station_history(station_id: str):
+    """Return the current rolling history for one station."""
+
+    history = station_history.get(station_id)
+
+    return {
+        "station_id": station_id,
+        "count": len(history),
+        "readings": history
+    }
+
+
+@app.get("/stations")
+def get_stations():
+    """Return stations currently known to the running prototype."""
+
+    stations = station_history.stations()
+
+    return {
+        "count": len(stations),
+        "stations": [
+            {
+                "station_id": station_id,
+                "history_size": station_history.count(station_id)
+            }
+            for station_id in stations
+        ]
+    }
+
+
+# =========================================================
+# Detection endpoint — manual/history-based testing
 # =========================================================
 
 @app.post("/detect")
 def detect(readings: list[WeatherReading]):
+    """Run detection directly on a supplied sequence of readings."""
 
-    # Convert Pydantic objects into a DataFrame
     data = pd.DataFrame(
         [
             reading.model_dump()
@@ -118,8 +187,6 @@ def detect(readings: list[WeatherReading]):
         ]
     )
 
-    result = anomaly_service.detect(
-        data
-    )
+    result = anomaly_service.detect(data)
 
     return result
