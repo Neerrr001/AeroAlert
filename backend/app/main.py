@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.ml.feature_engineering import create_features
 from app.ml.random_forest import FEATURE_COLUMNS, train_random_forest
+from app.services.anomaly_history import AnomalyHistory
 from app.services.anomaly_service import AnomalyService
 from app.services.connection_manager import ConnectionManager
 from app.services.station_history import StationHistory
@@ -16,7 +17,7 @@ from app.services.station_history import StationHistory
 app = FastAPI(
     title="AeroAlert API",
     description="Intelligent anomaly detection for weather stations",
-    version="0.3.0",
+    version="0.4.0",
 )
 
 app.add_middleware(
@@ -55,6 +56,7 @@ print("Model ready.")
 
 anomaly_service = AnomalyService(model)
 station_history = StationHistory(max_length=48)
+anomaly_history = AnomalyHistory(max_length=100)
 connection_manager = ConnectionManager()
 
 
@@ -69,6 +71,7 @@ def health():
         "status": "healthy",
         "stations": len(station_history.stations()),
         "websocket_clients": len(connection_manager.active_connections),
+        "anomalies": anomaly_history.count(),
     }
 
 
@@ -91,8 +94,10 @@ async def ingest_telemetry(reading: WeatherReading):
         "detection": result,
     }
 
-    await connection_manager.broadcast(message, reading.station_id)
+    if result.get("is_anomaly"):
+        anomaly_history.add(message)
 
+    await connection_manager.broadcast(message, reading.station_id)
     return message
 
 
@@ -104,12 +109,22 @@ async def websocket_endpoint(websocket: WebSocket, station_id: str | None = None
 
     try:
         while True:
-            # The client can send a ping/message to keep the connection active.
             await websocket.receive_text()
     except WebSocketDisconnect:
         connection_manager.disconnect(websocket)
     except Exception:
         connection_manager.disconnect(websocket)
+
+
+@app.get("/anomalies")
+def get_anomalies(station_id: str | None = None):
+    """Return recent live anomaly decisions for the review dashboard."""
+
+    anomalies = anomaly_history.get(station_id)
+    return {
+        "count": len(anomalies),
+        "anomalies": anomalies,
+    }
 
 
 @app.get("/telemetry/{station_id}")
