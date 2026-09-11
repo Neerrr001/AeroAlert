@@ -49,56 +49,142 @@ function severityClasses(severity: string) {
   return "border-slate-700 bg-slate-900 text-slate-400";
 }
 
-function EvidenceChart({ points, anomalyType }: { points: TelemetryPoint[]; anomalyType: string }) {
-  const valid = points.filter((p) => p.temperature != null || p.pressure != null || p.humidity != null);
-  if (!valid.length) return <div className="py-10 text-center text-xs text-slate-500">No telemetry evidence was captured for this event.</div>;
+function EvidenceSeries({
+  label,
+  unit,
+  points,
+  getValue,
+  accent,
+}: {
+  label: string;
+  unit: string;
+  points: TelemetryPoint[];
+  getValue: (point: TelemetryPoint) => number | null;
+  accent: string;
+}) {
+  const values = points.map(getValue);
+  const numeric = values.filter((value): value is number => value != null && Number.isFinite(value));
+
+  if (!numeric.length) {
+    return (
+      <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+        <div className="text-[10px] font-mono uppercase tracking-widest text-slate-500">{label}</div>
+        <div className="mt-5 text-center text-xs text-slate-600">No data</div>
+      </div>
+    );
+  }
 
   const width = 900;
-  const height = 260;
+  const height = 150;
   const left = 48;
   const right = 18;
-  const top = 22;
-  const bottom = 34;
+  const top = 16;
+  const bottom = 25;
   const plotW = width - left - right;
   const plotH = height - top - bottom;
-  const series = [
-    { key: "temperature", label: "Temperature °C", value: (p: TelemetryPoint) => p.temperature, className: "text-rose-400" },
-    { key: "humidity", label: "Humidity %", value: (p: TelemetryPoint) => p.humidity, className: "text-sky-400" },
-    { key: "pressure", label: "Pressure hPa", value: (p: TelemetryPoint) => p.pressure, className: "text-violet-400" },
-  ];
-
-  const allValues = valid.flatMap((p) => series.map((s) => s.value(p)).filter((v): v is number => v != null && Number.isFinite(v)));
-  const min = Math.min(...allValues);
-  const max = Math.max(...allValues);
+  const rawMin = Math.min(...numeric);
+  const rawMax = Math.max(...numeric);
+  const rawRange = rawMax - rawMin;
+  const padding = rawRange === 0 ? Math.max(Math.abs(rawMin) * 0.02, 0.5) : rawRange * 0.12;
+  const min = rawMin - padding;
+  const max = rawMax + padding;
   const range = max - min || 1;
-  const x = (i: number) => left + (i / Math.max(1, valid.length - 1)) * plotW;
-  const y = (v: number) => top + (1 - (v - min) / range) * plotH;
-  const pathFor = (value: (p: TelemetryPoint) => number | null) => valid.map((p, i) => [x(i), value(p) == null ? null : y(value(p)!)] as const).filter((p): p is readonly [number, number] => p[1] != null).map((p, i, arr) => `${i === 0 ? "M" : "L"}${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(" ");
+  const x = (index: number) => left + (index / Math.max(1, points.length - 1)) * plotW;
+  const y = (value: number) => top + (1 - (value - min) / range) * plotH;
+
+  const pathSegments: string[] = [];
+  let currentSegment = "";
+  values.forEach((value, index) => {
+    if (value == null || !Number.isFinite(value)) {
+      if (currentSegment) {
+        pathSegments.push(currentSegment);
+        currentSegment = "";
+      }
+      return;
+    }
+    currentSegment += `${currentSegment ? " L" : "M"}${x(index).toFixed(1)} ${y(value).toFixed(1)}`;
+  });
+  if (currentSegment) pathSegments.push(currentSegment);
+
+  const latestIndex = [...values].reduce((last, value, index) => value != null && Number.isFinite(value) ? index : last, -1);
+  const previousIndex = latestIndex > 0
+    ? [...values.slice(0, latestIndex)].reduce((last, value, index) => value != null && Number.isFinite(value) ? index : last, -1)
+    : -1;
+  const latestValue = latestIndex >= 0 ? values[latestIndex] : null;
+  const previousValue = previousIndex >= 0 ? values[previousIndex] : null;
+  const change = latestValue != null && previousValue != null ? latestValue - previousValue : null;
+
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <span className={`h-2 w-2 rounded-full ${accent}`} />
+          <span className="text-[10px] font-mono uppercase tracking-widest text-slate-400">{label}</span>
+        </div>
+        <div className="flex items-center gap-3 text-[10px] font-mono">
+          <span className="text-slate-600">range {rawMin.toFixed(1)}–{rawMax.toFixed(1)} {unit}</span>
+          {change != null && <span className="text-slate-400">Δ {change >= 0 ? "+" : ""}{change.toFixed(1)} {unit}</span>}
+        </div>
+      </div>
+
+      <div className="mt-2 overflow-x-auto">
+        <svg viewBox={`0 0 ${width} ${height}`} className="h-[150px] min-w-[720px] w-full" role="img" aria-label={`${label} telemetry evidence`}>
+          {[0, 0.5, 1].map((ratio) => {
+            const yy = top + ratio * plotH;
+            const axisValue = max - ratio * range;
+            return (
+              <g key={ratio}>
+                <line x1={left} x2={width - right} y1={yy} y2={yy} stroke="currentColor" className="text-slate-800" strokeWidth="1" />
+                <text x={left - 7} y={yy + 3} textAnchor="end" className="fill-slate-600 text-[9px]">{axisValue.toFixed(1)}</text>
+              </g>
+            );
+          })}
+
+          <line x1={left} x2={width - right} y1={top + plotH} y2={top + plotH} stroke="currentColor" className="text-slate-700" />
+          {pathSegments.map((path, index) => (
+            <path key={index} d={path} fill="none" stroke="currentColor" className={accent.replace("bg-", "text-")} strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round" />
+          ))}
+
+          {latestIndex >= 0 && latestValue != null && (
+            <>
+              <line x1={x(latestIndex)} x2={x(latestIndex)} y1={top} y2={top + plotH} stroke="currentColor" strokeDasharray="4 4" className="text-amber-400/70" />
+              <circle cx={x(latestIndex)} cy={y(latestValue)} r="5" className="fill-amber-400" />
+              <text x={Math.min(width - 8, x(latestIndex) + 8)} y={Math.max(13, y(latestValue) - 8)} className="fill-amber-400 text-[9px]">FLAGGED</text>
+            </>
+          )}
+
+          <text x={left} y={height - 7} className="fill-slate-600 text-[9px]">{new Date(points[0].timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</text>
+          <text x={width - right} y={height - 7} textAnchor="end" className="fill-slate-600 text-[9px]">{new Date(points[points.length - 1].timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</text>
+        </svg>
+      </div>
+    </div>
+  );
+}
+
+function EvidenceChart({ points, anomalyType }: { points: TelemetryPoint[]; anomalyType: string }) {
+  if (!points.length) return <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-10 text-center text-xs text-slate-500">No telemetry evidence was captured for this event.</div>;
 
   return (
     <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <div className="text-[10px] font-mono uppercase tracking-widest text-slate-500">Telemetry evidence</div>
-          <div className="mt-1 text-xs text-slate-400">Latest {valid.length} readings captured around the {anomalyTitle(anomalyType).toLowerCase()} decision</div>
+          <div className="mt-1 text-xs text-slate-400">Temperature, humidity and pressure use independent scales but share one time axis.</div>
         </div>
-        <div className="flex flex-wrap gap-3 text-[10px] font-mono">
-          {series.map((s) => <span key={s.key} className={`${s.className} flex items-center gap-1.5`}><span className="h-1.5 w-4 rounded-full bg-current" />{s.label}</span>)}
-        </div>
+        <div className="text-[10px] font-mono text-amber-400">LAST READING = FLAGGED</div>
       </div>
-      <div className="mt-4 overflow-x-auto">
-        <svg viewBox={`0 0 ${width} ${height}`} className="h-[260px] min-w-[720px] w-full" role="img" aria-label="Temperature, humidity and pressure telemetry context">
-          {[0, 0.25, 0.5, 0.75, 1].map((ratio) => { const yy = top + ratio * plotH; const value = max - ratio * range; return <g key={ratio}><line x1={left} x2={width - right} y1={yy} y2={yy} stroke="currentColor" className="text-slate-800" strokeWidth="1" /><text x={left - 7} y={yy + 3} textAnchor="end" className="fill-slate-600 text-[9px]">{value.toFixed(1)}</text></g>; })}
-          <line x1={left} x2={width - right} y1={top + plotH} y2={top + plotH} stroke="currentColor" className="text-slate-700" />
-          {series.map((s) => <path key={s.key} d={pathFor(s.value)} fill="none" stroke="currentColor" className={s.className} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />)}
-          {valid.map((p, i) => <circle key={i} cx={x(i)} cy={top + plotH} r="2" className="fill-slate-700" />)}
-          <line x1={x(valid.length - 1)} x2={x(valid.length - 1)} y1={top} y2={top + plotH} stroke="currentColor" strokeDasharray="4 4" className="text-amber-400/60" />
-          <text x={x(valid.length - 1) - 5} y={top + 10} textAnchor="end" className="fill-amber-400 text-[9px]">FLAGGED READING</text>
-          <text x={left} y={height - 8} className="fill-slate-600 text-[9px]">{new Date(valid[0].timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</text>
-          <text x={width - right} y={height - 8} textAnchor="end" className="fill-slate-600 text-[9px]">{new Date(valid[valid.length - 1].timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</text>
-        </svg>
+
+      <div className="mt-4 space-y-3">
+        <EvidenceSeries label="Temperature" unit="°C" points={points} getValue={(p) => p.temperature} accent="bg-rose-400" />
+        <EvidenceSeries label="Relative Humidity" unit="%" points={points} getValue={(p) => p.humidity} accent="bg-sky-400" />
+        <EvidenceSeries label="Atmospheric Pressure" unit="hPa" points={points} getValue={(p) => p.pressure} accent="bg-violet-400" />
       </div>
-      <p className="mt-2 text-[10px] leading-relaxed text-slate-600">The three variables share one visual scale for shape comparison; their units are shown in the legend. This chart is evidence context, not a calibrated meteorological plot.</p>
+
+      <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2 text-[10px] font-mono uppercase tracking-wider text-slate-600">
+        <div>Event: {anomalyTitle(anomalyType)}</div>
+        <div className="sm:text-center">Evidence: {points.length} readings</div>
+        <div className="sm:text-right">Time aligned</div>
+      </div>
     </div>
   );
 }
