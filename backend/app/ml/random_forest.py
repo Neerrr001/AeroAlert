@@ -28,6 +28,12 @@ FEATURE_COLUMNS = [
     "pressure_range_6h",
     "humidity_range_6h",
 
+    "temperature_mean_12h",
+    "temperature_mean_24h",
+    "temperature_baseline_shift",
+    "temperature_deviation_24h",
+    "persistent_deviation", 
+
     "temperature_persistence",
 ]
 

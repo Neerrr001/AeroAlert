@@ -5,232 +5,363 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Create time-series features for AeroAlert.
 
-    Input:
-        DataFrame containing:
-            timestamp
-            station_id
-            temperature
-            pressure
-            humidity
+    If event_id is present, features are calculated independently
+    within each event so that one synthetic event cannot affect
+    another event's time-series features.
 
-    Output:
-        DataFrame with additional time-series features.
+    Expected input columns:
+        timestamp
+        station_id
+        temperature
+        pressure
+        humidity
+
+    Optional column:
+        event_id
     """
 
     # ---------------------------------------------------------
-    # 0. Copy and sort
+    # 0. Copy and prepare
     # ---------------------------------------------------------
 
-    # Don't modify the original DataFrame
     df = df.copy()
 
-    # Make sure observations are chronological
-    df = (
-        df.sort_values("timestamp")
-        .reset_index(drop=True)
+    # Convert timestamp in case the caller hasn't already done so.
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        utc=True
     )
+
+    # Preserve original row order.
+    df["_original_order"] = range(len(df))
 
     # ---------------------------------------------------------
-    # 1. Change from previous reading
+    # Helper: process one independent time series
     # ---------------------------------------------------------
 
-    df["temperature_change"] = (
-        df["temperature"].diff()
-    )
+    def process_group(group: pd.DataFrame) -> pd.DataFrame:
 
-    df["pressure_change"] = (
-        df["pressure"].diff()
-    )
-
-    df["humidity_change"] = (
-        df["humidity"].diff()
-    )
-
-    # ---------------------------------------------------------
-    # 2. Multi-hour changes
-    # ---------------------------------------------------------
-
-    # How much has each variable changed compared with
-    # 3 hours ago and 6 hours ago?
-
-    df["temperature_change_3h"] = (
-        df["temperature"]
-        - df["temperature"].shift(3)
-    )
-
-    df["temperature_change_6h"] = (
-        df["temperature"]
-        - df["temperature"].shift(6)
-    )
-
-    df["pressure_change_3h"] = (
-        df["pressure"]
-        - df["pressure"].shift(3)
-    )
-
-    df["pressure_change_6h"] = (
-        df["pressure"]
-        - df["pressure"].shift(6)
-    )
-
-    df["humidity_change_3h"] = (
-        df["humidity"]
-        - df["humidity"].shift(3)
-    )
-
-    df["humidity_change_6h"] = (
-        df["humidity"]
-        - df["humidity"].shift(6)
-    )
-
-    # ---------------------------------------------------------
-    # 3. Rolling statistics
-    #
-    # IMPORTANT:
-    # shift(1) means the current reading is NOT included
-    # in its own baseline.
-    # ---------------------------------------------------------
-
-    WINDOW = 6
-
-    previous_temperature = (
-        df["temperature"].shift(1)
-    )
-
-    previous_pressure = (
-        df["pressure"].shift(1)
-    )
-
-    previous_humidity = (
-        df["humidity"].shift(1)
-    )
-
-    # ---------------------------------------------------------
-    # 3a. Rolling means
-    # ---------------------------------------------------------
-
-    df["temperature_rolling_mean"] = (
-        previous_temperature
-        .rolling(WINDOW)
-        .mean()
-    )
-
-    df["pressure_rolling_mean"] = (
-        previous_pressure
-        .rolling(WINDOW)
-        .mean()
-    )
-
-    df["humidity_rolling_mean"] = (
-        previous_humidity
-        .rolling(WINDOW)
-        .mean()
-    )
-
-    # ---------------------------------------------------------
-    # 3b. Rolling standard deviations
-    # ---------------------------------------------------------
-
-    df["temperature_rolling_std"] = (
-        previous_temperature
-        .rolling(WINDOW)
-        .std()
-    )
-
-    df["pressure_rolling_std"] = (
-        previous_pressure
-        .rolling(WINDOW)
-        .std()
-    )
-
-    df["humidity_rolling_std"] = (
-        previous_humidity
-        .rolling(WINDOW)
-        .std()
-    )
-
-    # ---------------------------------------------------------
-    # 4. Absolute changes
-    # ---------------------------------------------------------
-
-    df["temperature_abs_change"] = (
-        df["temperature_change"].abs()
-    )
-
-    df["pressure_abs_change"] = (
-        df["pressure_change"].abs()
-    )
-
-    df["humidity_abs_change"] = (
-        df["humidity_change"].abs()
-    )
-
-    # ---------------------------------------------------------
-    # 5. Deviation from recent mean
-    # ---------------------------------------------------------
-
-    df["temperature_deviation"] = (
-        df["temperature"]
-        - df["temperature_rolling_mean"]
-    )
-
-    df["pressure_deviation"] = (
-        df["pressure"]
-        - df["pressure_rolling_mean"]
-    )
-
-    df["humidity_deviation"] = (
-        df["humidity"]
-        - df["humidity_rolling_mean"]
-    )
-
-    # ---------------------------------------------------------
-    # 6. Environmental movement
-    # ---------------------------------------------------------
-
-    df["environmental_change"] = (
-        df["pressure_abs_change"].fillna(0)
-        + df["humidity_abs_change"].fillna(0)
-    )
-
-    # ---------------------------------------------------------
-    # 7. Environmental ranges over previous 6 hours
-    # ---------------------------------------------------------
-
-    df["pressure_range_6h"] = (
-        previous_pressure
-        .rolling(WINDOW)
-        .max()
-        - previous_pressure
-        .rolling(WINDOW)
-        .min()
-    )
-
-    df["humidity_range_6h"] = (
-        previous_humidity
-        .rolling(WINDOW)
-        .max()
-        - previous_humidity
-        .rolling(WINDOW)
-        .min()
-    )
-
-    # ---------------------------------------------------------
-    # 8. Temperature persistence
-    # ---------------------------------------------------------
-
-    # Counts how many consecutive readings have had exactly
-    # the same temperature value.
-
-    df["temperature_persistence"] = (
-        df["temperature"]
-        .groupby(
-            df["temperature"].ne(
-                df["temperature"].shift()
-            ).cumsum()
+        group = (
+            group
+            .sort_values("timestamp")
+            .reset_index(drop=True)
         )
-        .cumcount()
-        + 1
+
+        # -----------------------------------------------------
+        # 1. One-hour changes
+        # -----------------------------------------------------
+
+        group["temperature_change"] = (
+            group["temperature"].diff()
+        )
+
+        group["pressure_change"] = (
+            group["pressure"].diff()
+        )
+
+        group["humidity_change"] = (
+            group["humidity"].diff()
+        )
+
+        # -----------------------------------------------------
+        # 2. Multi-hour changes
+        # -----------------------------------------------------
+
+        group["temperature_change_3h"] = (
+            group["temperature"]
+            - group["temperature"].shift(3)
+        )
+
+        group["temperature_change_6h"] = (
+            group["temperature"]
+            - group["temperature"].shift(6)
+        )
+
+        group["pressure_change_3h"] = (
+            group["pressure"]
+            - group["pressure"].shift(3)
+        )
+
+        group["pressure_change_6h"] = (
+            group["pressure"]
+            - group["pressure"].shift(6)
+        )
+
+        group["humidity_change_3h"] = (
+            group["humidity"]
+            - group["humidity"].shift(3)
+        )
+
+        group["humidity_change_6h"] = (
+            group["humidity"]
+            - group["humidity"].shift(6)
+        )
+
+        # -----------------------------------------------------
+        # 3. Previous-reading rolling baseline
+        #
+        # The current reading is excluded from the baseline.
+        # This prevents data leakage.
+        # -----------------------------------------------------
+
+        WINDOW = 6
+
+        previous_temperature = (
+            group["temperature"].shift(1)
+        )
+
+        previous_pressure = (
+            group["pressure"].shift(1)
+        )
+
+        previous_humidity = (
+            group["humidity"].shift(1)
+        )
+
+        # -----------------------------------------------------
+        # 3a. Rolling means
+        # -----------------------------------------------------
+
+        group["temperature_rolling_mean"] = (
+            previous_temperature
+            .rolling(WINDOW)
+            .mean()
+        )
+
+        group["pressure_rolling_mean"] = (
+            previous_pressure
+            .rolling(WINDOW)
+            .mean()
+        )
+
+        group["humidity_rolling_mean"] = (
+            previous_humidity
+            .rolling(WINDOW)
+            .mean()
+        )
+
+        # -----------------------------------------------------
+        # 3b. Rolling standard deviations
+        # -----------------------------------------------------
+
+        group["temperature_rolling_std"] = (
+            previous_temperature
+            .rolling(WINDOW)
+            .std()
+        )
+
+        group["pressure_rolling_std"] = (
+            previous_pressure
+            .rolling(WINDOW)
+            .std()
+        )
+
+        group["humidity_rolling_std"] = (
+            previous_humidity
+            .rolling(WINDOW)
+            .std()
+        )
+
+        # -----------------------------------------------------
+        # 4. Absolute changes
+        # -----------------------------------------------------
+
+        group["temperature_abs_change"] = (
+            group["temperature_change"].abs()
+        )
+
+        group["pressure_abs_change"] = (
+            group["pressure_change"].abs()
+        )
+
+        group["humidity_abs_change"] = (
+            group["humidity_change"].abs()
+        )
+
+        # -----------------------------------------------------
+        # 5. Deviation from recent mean
+        # -----------------------------------------------------
+
+        group["temperature_deviation"] = (
+            group["temperature"]
+            - group["temperature_rolling_mean"]
+        )
+
+        group["pressure_deviation"] = (
+            group["pressure"]
+            - group["pressure_rolling_mean"]
+        )
+
+        group["humidity_deviation"] = (
+            group["humidity"]
+            - group["humidity_rolling_mean"]
+        )
+
+        # -----------------------------------------------------
+        # 6. Environmental movement
+        # -----------------------------------------------------
+
+        group["environmental_change"] = (
+            group["pressure_abs_change"].fillna(0)
+            + group["humidity_abs_change"].fillna(0)
+        )
+
+        # -----------------------------------------------------
+        # 7. Environmental ranges
+        # -----------------------------------------------------
+
+        group["pressure_range_6h"] = (
+            previous_pressure
+            .rolling(WINDOW)
+            .max()
+            -
+            previous_pressure
+            .rolling(WINDOW)
+            .min()
+        )
+
+        group["humidity_range_6h"] = (
+            previous_humidity
+            .rolling(WINDOW)
+            .max()
+            -
+            previous_humidity
+            .rolling(WINDOW)
+            .min()
+        )
+
+        # -----------------------------------------------------
+        # 8. Longer-term temperature baselines
+        #
+        # These features help detect persistent level shifts
+        # such as STEP_CHANGE anomalies.
+        #
+        # The current reading is excluded from the baselines.
+        # -----------------------------------------------------
+
+        # 12-hour temperature baseline
+        group["temperature_mean_12h"] = (
+            previous_temperature
+            .rolling(
+                window=12,
+                min_periods=6
+            )
+            .mean()
+        )
+
+        # 24-hour temperature baseline
+        group["temperature_mean_24h"] = (
+            previous_temperature
+            .rolling(
+                window=24,
+                min_periods=12
+            )
+            .mean()
+        )
+
+        # -----------------------------------------------------
+        # 8a. Persistent baseline shift
+        #
+        # Difference between the short-term temperature level
+        # and the longer-term temperature level.
+        #
+        # A persistent sensor offset should cause this feature
+        # to remain significantly different from zero.
+        # -----------------------------------------------------
+
+        group["temperature_baseline_shift"] = (
+            group["temperature_rolling_mean"]
+            - group["temperature_mean_24h"]
+        )
+
+        # -----------------------------------------------------
+        # 8b. Current temperature vs long-term baseline
+        # -----------------------------------------------------
+
+        group["temperature_deviation_24h"] = (
+            group["temperature"]
+            - group["temperature_mean_24h"]
+        )
+
+        # -----------------------------------------------------
+        # 8c. Persistent deviation
+        #
+        # Measures whether recent readings have consistently
+        # remained far from the longer-term baseline.
+        #
+        # shift(1) ensures the current reading does not affect
+        # the feature used to detect that same reading.
+        # -----------------------------------------------------
+
+        group["persistent_deviation"] = (
+            group["temperature_deviation_24h"]
+            .shift(1)
+            .abs()
+            .rolling(
+                window=6,
+                min_periods=3
+            )
+            .mean()
+        )
+
+        # -----------------------------------------------------
+        # 8d. Temperature persistence
+        # -----------------------------------------------------
+
+        # Number of consecutive readings with exactly the
+        # same temperature.
+        group["temperature_persistence"] = (
+            group["temperature"]
+            .groupby(
+                group["temperature"].ne(
+                    group["temperature"].shift()
+                ).cumsum()
+            )
+            .cumcount()
+            + 1
+        )
+
+        return group
+
+    # ---------------------------------------------------------
+    # 9. Process independent events
+    # ---------------------------------------------------------
+
+    if "event_id" in df.columns:
+
+        # Apply feature engineering independently to each
+        # event. We deliberately do NOT use include_groups=True
+        # because newer pandas versions no longer allow it.
+
+        processed_groups = []
+
+        for _, group in df.groupby(
+            "event_id",
+            sort=False
+        ):
+            processed_groups.append(
+                process_group(group)
+            )
+
+        df = pd.concat(
+            processed_groups,
+            ignore_index=True
+        )
+
+    else:
+
+        # Normal application data without event_id
+        df = process_group(df)
+
+    # ---------------------------------------------------------
+    # 10. Restore original row order
+    # ---------------------------------------------------------
+
+    df = (
+        df
+        .sort_values("_original_order")
+        .drop(columns="_original_order")
+        .reset_index(drop=True)
     )
 
     return df
