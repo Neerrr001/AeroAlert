@@ -17,7 +17,7 @@ from app.services.station_history import StationHistory
 app = FastAPI(
     title="AeroAlert API",
     description="Intelligent anomaly detection for weather stations",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 app.add_middleware(
@@ -77,12 +77,25 @@ def health():
 
 @app.post("/telemetry")
 async def ingest_telemetry(reading: WeatherReading):
-    """Ingest one reading, detect anomalies, and broadcast the result live."""
+    """Ingest one reading, detect anomalies, retain evidence, and broadcast live."""
 
     reading_data = reading.model_dump()
     station_history.add(reading.station_id, reading_data)
     history = station_history.get(reading.station_id)
     result = anomaly_service.detect(pd.DataFrame(history))
+
+    # Keep the latest 12 observations as evidence for the review screen.
+    evidence = []
+    for context_reading in history[-12:]:
+        timestamp = context_reading["timestamp"]
+        evidence.append(
+            {
+                "timestamp": timestamp.isoformat() if isinstance(timestamp, datetime) else str(timestamp),
+                "temperature": context_reading["temperature"],
+                "pressure": context_reading["pressure"],
+                "humidity": context_reading["humidity"],
+            }
+        )
 
     message = {
         "station_id": reading.station_id,
@@ -92,6 +105,7 @@ async def ingest_telemetry(reading: WeatherReading):
         "humidity": reading.humidity,
         "history_size": len(history),
         "detection": result,
+        "telemetry_context": evidence,
     }
 
     if result.get("is_anomaly"):
@@ -118,7 +132,7 @@ async def websocket_endpoint(websocket: WebSocket, station_id: str | None = None
 
 @app.get("/anomalies")
 def get_anomalies(station_id: str | None = None):
-    """Return recent live anomaly decisions for the review dashboard."""
+    """Return recent live anomaly decisions, including telemetry evidence."""
 
     anomalies = anomaly_history.get(station_id)
     return {
