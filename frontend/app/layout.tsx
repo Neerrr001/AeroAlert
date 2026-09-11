@@ -50,8 +50,6 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
                 { href: "/stations", label: "Station Network", icon: Server },
                 { href: "/live", label: "Live Telemetry", icon: Activity },
                 { href: "/anomalies", label: "Anomaly Review", icon: ShieldAlert },
-                { href: "/alerts", label: "Alert Feed", icon: Bell },
-                { href: "/health", label: "Station Health", icon: Server },
                 { href: "/model", label: "Model Metrics", icon: CheckCircle2 },
                 { href: "/about", label: "System Architecture", icon: FileText },
               ].map((item) => {
