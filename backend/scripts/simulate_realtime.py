@@ -9,6 +9,7 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT = BASE_DIR / "data" / "simulated" / "weather_with_anomalies.csv"
 DEMO_TYPES = ["SPIKE", "FROZEN_SENSOR", "STEP_CHANGE", "DRIFT", "MISSING_DATA"]
+DEFAULT_STATIONS = ["LUCKNOW_001"]
 
 
 def parse_args():
@@ -21,6 +22,11 @@ def parse_args():
     parser.add_argument("--start", type=int, default=None)
     parser.add_argument("--count", type=int, default=None)
     parser.add_argument("--station-id", default=None)
+    parser.add_argument(
+        "--stations",
+        default=None,
+        help="Comma-separated station IDs. In multi-station mode each station receives its own telemetry stream.",
+    )
     parser.add_argument(
         "--demo",
         action="store_true",
@@ -51,6 +57,15 @@ def parse_args():
         help="Pause between demo scenarios in seconds.",
     )
     return parser.parse_args()
+
+
+def parse_station_ids(args, default_station_id):
+    if args.stations:
+        stations = [station.strip() for station in args.stations.split(",") if station.strip()]
+        if not stations:
+            raise RuntimeError("--stations must contain at least one station ID.")
+        return stations
+    return [args.station_id or default_station_id]
 
 
 def clean_value(value):
@@ -84,6 +99,7 @@ def replay_rows(rows, args, station_id, session, phase_label="REPLAY"):
         detection = result["detection"]
         print(
             f"[{phase_label} {index:02d}] "
+            f"{station_id} | "
             f"{payload['timestamp']} | "
             f"T={payload['temperature']}°C "
             f"P={payload['pressure']} hPa "
@@ -95,10 +111,31 @@ def replay_rows(rows, args, station_id, session, phase_label="REPLAY"):
         time.sleep(args.interval)
 
 
+def replay_rows_multi_station(rows, args, station_ids, session, phase_label="MULTI"):
+    """Send the same timeline independently to several logical stations."""
+    for index, (_, row) in enumerate(rows.iterrows(), start=1):
+        for station_id in station_ids:
+            try:
+                payload, result = post_reading(row, args.url, station_id, session)
+            except requests.RequestException as exc:
+                raise RuntimeError(
+                    f"Request failed for {station_id}: {exc}\n"
+                    "Is the FastAPI server running on port 8000?"
+                ) from exc
+
+            detection = result["detection"]
+            print(
+                f"[{phase_label} {index:02d}] "
+                f"{station_id} | {payload['timestamp']} | "
+                f"{detection['type']} | confidence={detection['confidence']:.3f}"
+            )
+        time.sleep(args.interval)
+
+
 def find_demo_event(df, anomaly_type):
     matches = df.index[df["anomaly_type"].astype(str) == anomaly_type].tolist()
     if not matches:
-        raise RuntimeError(f"No injected {anomaly_type} event found in {df.name if hasattr(df, 'name') else 'dataset'}.")
+        raise RuntimeError(f"No injected {anomaly_type} event found in the dataset.")
     return matches[0]
 
 
@@ -121,18 +158,20 @@ def build_demo_segment(df, anomaly_type, clean_readings, event_readings):
     return clean_segment, event_segment
 
 
-def run_demo(df, args, station_id, session):
+def run_demo(df, args, station_ids, session):
     scenarios = DEMO_TYPES if args.scenario == "ALL" else [args.scenario]
 
     print("\nAeroAlert guided demo")
     print("=" * 72)
-    print(f"Station: {station_id}")
+    print(f"Stations: {', '.join(station_ids)}")
     print(f"Scenarios: {', '.join(scenarios)}")
     print(
         f"Per scenario: {args.clean_readings} clean + "
         f"{args.event_readings} fault readings"
     )
     print("Ground-truth labels are used only by the simulator to select demo slices; they are NOT sent to the API.")
+    if len(station_ids) > 1:
+        print("Multi-station mode: every station receives its own independent history and live detections.")
     print("=" * 72)
 
     for number, anomaly_type in enumerate(scenarios, start=1):
@@ -147,22 +186,24 @@ def run_demo(df, args, station_id, session):
         print(f"  Clean buffer: {len(clean_segment)} readings")
         print(f"  Fault segment: {len(event_segment)} readings")
 
-        replay_rows(
-            clean_segment,
-            args,
-            station_id,
-            session,
-            phase_label=f"{anomaly_type} CLEAN",
-        )
+        for station_id in station_ids:
+            replay_rows(
+                clean_segment,
+                args,
+                station_id,
+                session,
+                phase_label=f"{anomaly_type} {station_id} CLEAN",
+            )
 
         print(f"\n>>> INJECTED {anomaly_type} EVENT <<<\n")
-        replay_rows(
-            event_segment,
-            args,
-            station_id,
-            session,
-            phase_label=f"{anomaly_type} FAULT",
-        )
+        for station_id in station_ids:
+            replay_rows(
+                event_segment,
+                args,
+                station_id,
+                session,
+                phase_label=f"{anomaly_type} {station_id} FAULT",
+            )
 
         if number < len(scenarios):
             print(f"\n--- Holding for {args.pause:.1f}s before next fault ---\n")
@@ -178,13 +219,15 @@ def main():
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
     default_station_id = (
-        str(df["station_id"].dropna().iloc[0]) if "station_id" in df.columns else "LUCKNOW_001"
+        str(df["station_id"].dropna().iloc[0])
+        if "station_id" in df.columns
+        else "LUCKNOW_001"
     )
-    station_id = args.station_id or default_station_id
+    station_ids = parse_station_ids(args, default_station_id)
 
     with requests.Session() as session:
         if args.demo:
-            run_demo(df, args, station_id, session)
+            run_demo(df, args, station_ids, session)
             return
 
         start = args.start or 0
@@ -192,10 +235,13 @@ def main():
         replay = df.iloc[start:end]
 
         print(f"Replaying {len(replay)} readings to {args.url}")
-        print(f"Station: {station_id}")
+        print(f"Stations: {', '.join(station_ids)}")
         print(f"Interval: {args.interval:.2f}s")
 
-        replay_rows(replay, args, station_id, session)
+        if len(station_ids) == 1:
+            replay_rows(replay, args, station_ids[0], session)
+        else:
+            replay_rows_multi_station(replay, args, station_ids, session)
 
 
 if __name__ == "__main__":
