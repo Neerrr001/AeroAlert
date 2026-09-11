@@ -18,7 +18,7 @@ from app.services.station_history import StationHistory
 app = FastAPI(
     title="AeroAlert API",
     description="Intelligent anomaly detection for weather stations",
-    version="0.6.0",
+    version="0.7.0",
 )
 
 app.add_middleware(
@@ -77,6 +77,25 @@ def health():
         "websocket_clients": len(connection_manager.active_connections),
         "anomalies": anomaly_history.count(),
         "operator_decisions": len(operator_decisions.all()),
+    }
+
+
+@app.get("/model/feature-importance")
+def feature_importance():
+    """Return Random Forest impurity-based feature importance from the live model."""
+    importances = model.feature_importances_
+    ranked = sorted(
+        zip(FEATURE_COLUMNS, importances),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return {
+        "algorithm": "Random Forest Classifier",
+        "method": "impurity-based feature importance",
+        "features": [
+            {"feature": feature, "importance": float(importance)}
+            for feature, importance in ranked
+        ],
     }
 
 
