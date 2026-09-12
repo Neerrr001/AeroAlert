@@ -40,6 +40,38 @@ def seed_station(session, station_id, name):
         session.add(Station(station_id=station_id, name=name))
 
 
+def find_demo_event(df: pd.DataFrame, service: AnomalyService, anomaly_type: str):
+    """Find an event the live detector can actually evaluate for the demo."""
+    matches = df.index[df["anomaly_type"].astype(str) == anomaly_type]
+    best = None
+
+    for raw_index in matches:
+        event_index = int(raw_index)
+        if event_index < 48:
+            continue
+
+        context = df.iloc[event_index - 48:event_index + 1].copy()
+        result = service.detect(context)
+
+        if not result.get("is_anomaly", False):
+            continue
+
+        # Prefer a detection whose predicted type matches the injected type.
+        if str(result.get("type")) == anomaly_type:
+            return event_index, context, result
+
+        # Keep the strongest anomaly as a fallback if the model labels the
+        # event differently. This still gives the operator useful evidence.
+        confidence = float(result.get("confidence", 0.0))
+        if best is None or confidence > best[2]:
+            best = (event_index, context, confidence, result)
+
+    if best is not None:
+        return best[0], best[1], best[3]
+
+    return None
+
+
 def seed_demo(session, service):
     df = pd.read_csv(SIMULATED_PATH)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -49,21 +81,14 @@ def seed_demo(session, service):
     session.execute(delete(Anomaly).where(Anomaly.station_id == station_id))
 
     for anomaly_type in DEMO_TYPES:
-        matches = df.index[df["anomaly_type"].astype(str) == anomaly_type]
-        # Use a later event so the detector has enough clean history for
-        # rolling/24-hour features instead of returning "not enough data".
-        valid_matches = [int(i) for i in matches if int(i) >= 48]
-        if not valid_matches:
+        selected = find_demo_event(df, service, anomaly_type)
+        if selected is None:
             continue
 
-        event_index = valid_matches[0]
-        start = event_index - 48
-        end = min(len(df), event_index + 1)
-        context = df.iloc[start:end].copy()
-        result = service.detect(context)
+        event_index, context, result = selected
         row = df.iloc[event_index]
-
         timestamp = pd.Timestamp(row["timestamp"]).to_pydatetime()
+
         context_rows = []
         for _, context_row in context.tail(24).iterrows():
             context_rows.append(
@@ -75,21 +100,14 @@ def seed_demo(session, service):
                 }
             )
 
-        # Keep the ground-truth anomaly type, but use the detector's actual
-        # confidence/reason when it successfully evaluates the event.
-        detected = bool(result.get("is_anomaly", False))
-        severity = result.get("severity", "HIGH") if detected else "HIGH"
-        confidence = float(result.get("confidence", 0.0)) if detected else 0.0
-        reason = result.get("reason") if detected else f"Injected {anomaly_type} demonstration event."
-
         session.add(
             Anomaly(
                 station_id=station_id,
                 timestamp=timestamp,
                 type=anomaly_type,
-                severity=severity,
-                confidence=confidence,
-                reason=reason,
+                severity=result.get("severity", "HIGH"),
+                confidence=float(result.get("confidence", 0.0)),
+                reason=result.get("reason", f"Injected {anomaly_type} demonstration event."),
                 temperature=None if pd.isna(row["temperature"]) else float(row["temperature"]),
                 pressure=None if pd.isna(row["pressure"]) else float(row["pressure"]),
                 humidity=None if pd.isna(row["humidity"]) else float(row["humidity"]),
