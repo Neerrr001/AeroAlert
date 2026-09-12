@@ -156,6 +156,17 @@ export default function LiveTelemetryPage() {
 
   const detection = latest?.detection;
 
+  const metrics: Array<{
+    label: string;
+    value: number | null;
+    unit: string;
+    Icon: typeof Thermometer;
+  }> = [
+    ["Temperature", latest?.temperature ?? null, "°C", Thermometer],
+    ["Relative Humidity", latest?.humidity ?? null, "%", Droplets],
+    ["Pressure", latest?.pressure ?? null, "hPa", Gauge],
+  ].map(([label, value, unit, Icon]) => ({ label, value, unit, Icon }));
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-4 border-b border-slate-800 pb-5 md:flex-row md:items-center md:justify-between">
@@ -187,27 +198,20 @@ export default function LiveTelemetryPage() {
       )}
 
       <div className="grid gap-4 md:grid-cols-3">
-        {[
-          ["Temperature", latest?.temperature ?? null, "°C", Thermometer],
-          ["Relative Humidity", latest?.humidity ?? null, "%", Droplets],
-          ["Pressure", latest?.pressure ?? null, "hPa", Gauge],
-        ].map(([label, value, unit, Icon]) => {
-          const MetricIcon = Icon as typeof Thermometer;
-          return (
-            <div key={String(label)} className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
-              <div className="flex items-center justify-between text-slate-500">
-                <span className="text-[11px] font-mono uppercase tracking-widest">{label}</span>
-                <MetricIcon className="h-4 w-4 text-slate-400" />
-              </div>
-              <div className="mt-4 flex items-end gap-2">
-                <span className="text-3xl font-bold text-slate-100 font-mono">
-                  {formatNumber(value as number | null)}
-                </span>
-                <span className="pb-1 text-sm text-slate-500">{String(unit)}</span>
-              </div>
+        {metrics.map(({ label, value, unit, Icon }) => (
+          <div key={label} className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
+            <div className="flex items-center justify-between text-slate-500">
+              <span className="text-[11px] font-mono uppercase tracking-widest">{label}</span>
+              <Icon className="h-4 w-4 text-slate-400" />
             </div>
-          );
-        })}
+            <div className="mt-4 flex items-end gap-2">
+              <span className="text-3xl font-bold text-slate-100 font-mono">
+                {formatNumber(value)}
+              </span>
+              <span className="pb-1 text-sm text-slate-500">{unit}</span>
+            </div>
+          </div>
+        ))}
       </div>
 
       <div className="grid gap-6 lg:grid-cols-[1.3fr_0.7fr]">
