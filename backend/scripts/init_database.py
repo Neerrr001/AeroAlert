@@ -41,9 +41,9 @@ def seed_station(session, station_id, name):
 
 
 def find_demo_event(df: pd.DataFrame, service: AnomalyService, anomaly_type: str):
-    """Find an event the live detector can actually evaluate for the demo."""
+    """Choose the strongest correctly classified example for the demo."""
     matches = df.index[df["anomaly_type"].astype(str) == anomaly_type]
-    best = None
+    best_match = None
 
     for raw_index in matches:
         event_index = int(raw_index)
@@ -55,21 +55,26 @@ def find_demo_event(df: pd.DataFrame, service: AnomalyService, anomaly_type: str
 
         if not result.get("is_anomaly", False):
             continue
+        if str(result.get("type")) != anomaly_type:
+            continue
 
-        # Prefer a detection whose predicted type matches the injected type.
-        if str(result.get("type")) == anomaly_type:
-            return event_index, context, result
-
-        # Keep the strongest anomaly as a fallback if the model labels the
-        # event differently. This still gives the operator useful evidence.
         confidence = float(result.get("confidence", 0.0))
-        if best is None or confidence > best[2]:
-            best = (event_index, context, confidence, result)
+        candidate = (confidence, event_index, context, result)
 
-    if best is not None:
-        return best[0], best[1], best[3]
+        if best_match is None or confidence > best_match[0]:
+            best_match = candidate
 
-    return None
+    if best_match is None:
+        return None
+
+    _, event_index, context, result = best_match
+    return event_index, context, result
+
+
+def build_class_probabilities(result: dict) -> dict:
+    """Return a JSON-safe copy of the detector's class probabilities."""
+    probabilities = result.get("class_probabilities") or {}
+    return {str(label): float(value) for label, value in probabilities.items()}
 
 
 def seed_demo(session, service):
@@ -77,18 +82,30 @@ def seed_demo(session, service):
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     station_id = STATIONS[0][0]
 
-    # Re-seeding should produce exactly five deterministic demo anomalies.
+    # Re-seeding should replace only the deterministic Lucknow demo anomalies.
     session.execute(delete(Anomaly).where(Anomaly.station_id == station_id))
 
     for anomaly_type in DEMO_TYPES:
-        selected = find_demo_event(df, service, anomaly_type)
-        if selected is None:
-            continue
+        if anomaly_type == "MISSING_DATA":
+            # Missing-data is a deterministic rule-level case; the other four
+            # types are selected by highest correctly-classified RF confidence.
+            missing_matches = df.index[df["anomaly_type"].astype(str) == anomaly_type]
+            if len(missing_matches) == 0:
+                continue
+            event_index = int(missing_matches[0])
+            context = df.iloc[max(0, event_index - 48):event_index + 1].copy()
+            result = service.detect(context)
+        else:
+            selected = find_demo_event(df, service, anomaly_type)
+            if selected is None:
+                continue
+            event_index, context, result = selected
 
-        event_index, context, result = selected
         row = df.iloc[event_index]
         timestamp = pd.Timestamp(row["timestamp"]).to_pydatetime()
 
+        # Keep 24 hours visible to the dashboard, while the detector used a
+        # 48-hour context to make its temporal features as realistic as possible.
         context_rows = []
         for _, context_row in context.tail(24).iterrows():
             context_rows.append(
@@ -99,6 +116,13 @@ def seed_demo(session, service):
                     "humidity": None if pd.isna(context_row["humidity"]) else float(context_row["humidity"]),
                 }
             )
+
+        # Store probabilities alongside the evidence so a persisted demo event
+        # retains the full explainability payload without changing the schema.
+        evidence_payload = {
+            "readings": context_rows,
+            "class_probabilities": build_class_probabilities(result),
+        }
 
         session.add(
             Anomaly(
@@ -111,7 +135,7 @@ def seed_demo(session, service):
                 temperature=None if pd.isna(row["temperature"]) else float(row["temperature"]),
                 pressure=None if pd.isna(row["pressure"]) else float(row["pressure"]),
                 humidity=None if pd.isna(row["humidity"]) else float(row["humidity"]),
-                telemetry_context=json.dumps(context_rows),
+                telemetry_context=json.dumps(evidence_payload),
             )
         )
 
