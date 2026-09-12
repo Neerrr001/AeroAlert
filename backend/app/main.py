@@ -2,7 +2,7 @@ from datetime import datetime
 from pathlib import Path
 import json
 import os
-from threading import Lock
+from threading import Lock, Thread
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -53,9 +53,6 @@ class OperatorDecision(BaseModel):
 BASE_DIR = Path(__file__).resolve().parent.parent
 TRAIN_PATH = BASE_DIR / "data" / "simulated" / "training_data.csv"
 
-# Lazy model loading is intentional: Render needs Uvicorn to bind its port
-# quickly. Training the Random Forest during module import can delay startup
-# enough for Render's port scanner to report no open port.
 _model = None
 _anomaly_service = None
 _model_lock = Lock()
@@ -96,6 +93,37 @@ def ensure_station(session, station_id: str):
     return station
 
 
+def seed_demo_if_empty():
+    """Populate the public demo once if the persistent database has no telemetry.
+
+    This runs in a daemon thread so Render can bind its web port immediately.
+    Neon keeps the resulting data across Render restarts and deploys.
+    """
+    try:
+        with SessionLocal() as session:
+            count = session.scalar(
+                select(func.count(TelemetryReading.id)).where(
+                    TelemetryReading.station_id == "LUCKNOW_001"
+                )
+            ) or 0
+        if count > 0:
+            print("Demo telemetry already exists; skipping seed.")
+            return
+
+        print("No demo telemetry found; seeding public demo in background...")
+        from scripts.init_database import STATIONS, build_service, seed_demo, seed_station
+
+        service = build_service()
+        with SessionLocal() as session:
+            for station_id, name in STATIONS:
+                seed_station(session, station_id, name)
+            seed_demo(session, service)
+            session.commit()
+        print("Public demo data seeded successfully.")
+    except Exception as exc:
+        print(f"Demo seed failed: {exc}")
+
+
 def anomaly_to_dict(anomaly: Anomaly):
     readings = []
     class_probabilities = {}
@@ -133,7 +161,7 @@ def anomaly_to_dict(anomaly: Anomaly):
 
 @app.on_event("startup")
 def startup():
-    """Load recent persisted telemetry into the in-memory detection window after a restart."""
+    """Load recent persisted telemetry and ensure the public demo has data."""
     with SessionLocal() as session:
         station_ids = session.scalars(select(Station.station_id)).all()
         for station_id in station_ids:
@@ -151,6 +179,8 @@ def startup():
                     "pressure": item.pressure,
                     "humidity": item.humidity,
                 })
+
+    Thread(target=seed_demo_if_empty, daemon=True).start()
 
 
 @app.get("/")
