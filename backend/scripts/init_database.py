@@ -7,7 +7,7 @@ import pandas as pd
 from sqlalchemy import delete, select
 
 from app.db import Base, SessionLocal, engine
-from app.models import Anomaly, Station
+from app.models import Anomaly, Station, TelemetryReading
 from app.ml.feature_engineering import create_features
 from app.ml.random_forest import FEATURE_COLUMNS, train_random_forest
 from app.services.anomaly_service import AnomalyService
@@ -82,8 +82,11 @@ def seed_demo(session, service):
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     station_id = STATIONS[0][0]
 
-    # Re-seeding should replace only the deterministic Lucknow demo anomalies.
+    # Re-seeding should replace only the deterministic Lucknow demo dataset.
     session.execute(delete(Anomaly).where(Anomaly.station_id == station_id))
+    session.execute(delete(TelemetryReading).where(TelemetryReading.station_id == station_id))
+
+    selected_events = []
 
     for anomaly_type in DEMO_TYPES:
         if anomaly_type == "MISSING_DATA":
@@ -101,11 +104,32 @@ def seed_demo(session, service):
                 continue
             event_index, context, result = selected
 
+        selected_events.append((anomaly_type, event_index, context.copy(), result))
+
+    # Persist the telemetry windows as real station readings, not just as JSON
+    # attached to anomalies. This makes the public dashboard useful immediately
+    # after deployment/restart without requiring a local simulator process.
+    telemetry_by_timestamp = {}
+    for _, _, context, _ in selected_events:
+        for _, context_row in context.iterrows():
+            timestamp = pd.Timestamp(context_row["timestamp"]).to_pydatetime()
+            telemetry_by_timestamp[timestamp] = {
+                "timestamp": timestamp,
+                "station_id": station_id,
+                "temperature": None if pd.isna(context_row["temperature"]) else float(context_row["temperature"]),
+                "pressure": None if pd.isna(context_row["pressure"]) else float(context_row["pressure"]),
+                "humidity": None if pd.isna(context_row["humidity"]) else float(context_row["humidity"]),
+            }
+
+    for reading in sorted(telemetry_by_timestamp.values(), key=lambda item: item["timestamp"]):
+        session.add(TelemetryReading(**reading))
+
+    for anomaly_type, event_index, context, result in selected_events:
         row = df.iloc[event_index]
         timestamp = pd.Timestamp(row["timestamp"]).to_pydatetime()
 
-        # Keep 24 hours visible to the dashboard, while the detector used a
-        # 48-hour context to make its temporal features as realistic as possible.
+        # Keep 24 hours visible to the anomaly review page, while the detector
+        # used a 48-hour context to make its temporal features more realistic.
         context_rows = []
         for _, context_row in context.tail(24).iterrows():
             context_rows.append(
@@ -117,8 +141,6 @@ def seed_demo(session, service):
                 }
             )
 
-        # Store probabilities alongside the evidence so a persisted demo event
-        # retains the full explainability payload without changing the schema.
         evidence_payload = {
             "readings": context_rows,
             "class_probabilities": build_class_probabilities(result),
