@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   Droplets,
   Gauge,
+  LucideIcon,
   Radio,
   Thermometer,
   Wifi,
@@ -34,6 +35,14 @@ type TelemetryMessage = {
 };
 
 type ConnectionStatus = "connecting" | "live" | "reconnecting";
+
+type Metric = {
+  label: string;
+  value: number | null;
+  unit: string;
+  Icon: LucideIcon;
+  change: string;
+};
 
 const STATION_ID = "LUCKNOW_001";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -131,17 +140,11 @@ export default function DashboardPage() {
   const delta = (current: number | null | undefined, old: number | null | undefined) =>
     current == null || old == null ? "—" : `${current - old >= 0 ? "+" : ""}${(current - old).toFixed(1)}`;
 
-  const metrics: Array<{
-    label: string;
-    value: number | null;
-    unit: string;
-    Icon: typeof Thermometer;
-    change: string;
-  }> = [
-    ["Temperature", latest?.temperature ?? null, "°C", Thermometer, delta(latest?.temperature, previous?.temperature)],
-    ["Relative Humidity", latest?.humidity ?? null, "%", Droplets, delta(latest?.humidity, previous?.humidity)],
-    ["Atmospheric Pressure", latest?.pressure ?? null, "hPa", Gauge, delta(latest?.pressure, previous?.pressure)],
-  ].map(([label, value, unit, Icon, change]) => ({ label, value, unit, Icon, change }));
+  const metrics: Metric[] = [
+    { label: "Temperature", value: latest?.temperature ?? null, unit: "°C", Icon: Thermometer, change: delta(latest?.temperature, previous?.temperature) },
+    { label: "Relative Humidity", value: latest?.humidity ?? null, unit: "%", Icon: Droplets, change: delta(latest?.humidity, previous?.humidity) },
+    { label: "Atmospheric Pressure", value: latest?.pressure ?? null, unit: "hPa", Icon: Gauge, change: delta(latest?.pressure, previous?.pressure) },
+  ];
 
   return (
     <div className="max-w-7xl mx-auto space-y-6">
