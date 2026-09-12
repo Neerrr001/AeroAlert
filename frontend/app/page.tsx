@@ -131,6 +131,18 @@ export default function DashboardPage() {
   const delta = (current: number | null | undefined, old: number | null | undefined) =>
     current == null || old == null ? "—" : `${current - old >= 0 ? "+" : ""}${(current - old).toFixed(1)}`;
 
+  const metrics: Array<{
+    label: string;
+    value: number | null;
+    unit: string;
+    Icon: typeof Thermometer;
+    change: string;
+  }> = [
+    ["Temperature", latest?.temperature ?? null, "°C", Thermometer, delta(latest?.temperature, previous?.temperature)],
+    ["Relative Humidity", latest?.humidity ?? null, "%", Droplets, delta(latest?.humidity, previous?.humidity)],
+    ["Atmospheric Pressure", latest?.pressure ?? null, "hPa", Gauge, delta(latest?.pressure, previous?.pressure)],
+  ].map(([label, value, unit, Icon, change]) => ({ label, value, unit, Icon, change }));
+
   return (
     <div className="max-w-7xl mx-auto space-y-6">
       <section className="rounded-2xl border border-slate-800 bg-slate-950/70 p-6 md:p-7">
@@ -154,19 +166,12 @@ export default function DashboardPage() {
       </section>
 
       <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
-        {[
-          ["Temperature", latest?.temperature ?? null, "°C", Thermometer, delta(latest?.temperature, previous?.temperature)],
-          ["Relative Humidity", latest?.humidity ?? null, "%", Droplets, delta(latest?.humidity, previous?.humidity)],
-          ["Atmospheric Pressure", latest?.pressure ?? null, "hPa", Gauge, delta(latest?.pressure, previous?.pressure)],
-        ].map(([label, value, unit, Icon, change]) => {
-          const MetricIcon = Icon as typeof Thermometer;
-          return (
-            <div key={String(label)} className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
-              <div className="flex items-center justify-between text-slate-500"><span className="text-[11px] font-mono uppercase tracking-widest">{label}</span><MetricIcon className="h-4 w-4" /></div>
-              <div className="mt-4 flex items-end justify-between"><div><span className="font-mono text-3xl font-bold text-slate-100">{formatNumber(value as number | null)}</span><span className="ml-2 text-sm text-slate-500">{String(unit)}</span></div><span className="font-mono text-xs text-slate-500">Δ {String(change)}</span></div>
-            </div>
-          );
-        })}
+        {metrics.map(({ label, value, unit, Icon, change }) => (
+          <div key={label} className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
+            <div className="flex items-center justify-between text-slate-500"><span className="text-[11px] font-mono uppercase tracking-widest">{label}</span><Icon className="h-4 w-4" /></div>
+            <div className="mt-4 flex items-end justify-between"><div><span className="font-mono text-3xl font-bold text-slate-100">{formatNumber(value)}</span><span className="ml-2 text-sm text-slate-500">{unit}</span></div><span className="font-mono text-xs text-slate-500">Δ {change}</span></div>
+          </div>
+        ))}
         <div className={`rounded-xl border p-5 ${statusClasses(detection)}`}>
           <div className="flex items-center justify-between opacity-70"><span className="text-[11px] font-mono uppercase tracking-widest">Current state</span>{detection?.is_anomaly ? <AlertTriangle className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />}</div>
           <div className="mt-4 font-mono text-2xl font-bold">{detection ? (detection.is_anomaly ? detection.type : "NORMAL") : "WAITING"}</div>
