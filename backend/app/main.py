@@ -7,7 +7,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 
 from app.db import Base, SessionLocal, engine
 from app.models import Anomaly, Station, TelemetryReading
@@ -76,28 +76,38 @@ def ensure_station(session, station_id: str):
 
 
 def anomaly_to_dict(anomaly: Anomaly):
-    context = []
+    readings = []
+    class_probabilities = {}
+
     if anomaly.telemetry_context:
         try:
-            context = json.loads(anomaly.telemetry_context)
+            payload = json.loads(anomaly.telemetry_context)
+            # New persisted format: {"readings": [...], "class_probabilities": {...}}
+            if isinstance(payload, dict):
+                readings = payload.get("readings", [])
+                class_probabilities = payload.get("class_probabilities", {})
+            # Backward compatibility with the earlier persisted list format.
+            elif isinstance(payload, list):
+                readings = payload
         except json.JSONDecodeError:
-            context = []
+            readings = []
+
     return {
         "station_id": anomaly.station_id,
         "timestamp": anomaly.timestamp.isoformat(),
         "temperature": anomaly.temperature,
         "pressure": anomaly.pressure,
         "humidity": anomaly.humidity,
-        "history_size": len(context),
+        "history_size": len(readings),
         "detection": {
             "is_anomaly": True,
             "type": anomaly.type,
             "severity": anomaly.severity,
             "confidence": anomaly.confidence,
             "reason": anomaly.reason,
-            "class_probabilities": {},
+            "class_probabilities": class_probabilities,
         },
-        "telemetry_context": context,
+        "telemetry_context": readings,
         "operator_decision": anomaly.operator_decision,
     }
 
@@ -132,8 +142,8 @@ def root():
 @app.get("/health")
 def health():
     with SessionLocal() as session:
-        stations = session.scalar(select(__import__("sqlalchemy").func.count(Station.id))) or 0
-        anomalies = session.scalar(select(__import__("sqlalchemy").func.count(Anomaly.id))) or 0
+        stations = session.scalar(select(func.count(Station.id))) or 0
+        anomalies = session.scalar(select(func.count(Anomaly.id))) or 0
     return {"status": "healthy", "stations": stations, "websocket_clients": len(connection_manager.active_connections), "anomalies": anomalies}
 
 
@@ -168,7 +178,10 @@ async def ingest_telemetry(reading: WeatherReading):
                     timestamp=reading.timestamp,
                     type=result["type"], severity=result["severity"], confidence=float(result["confidence"]),
                     reason=result["reason"], temperature=reading.temperature, pressure=reading.pressure,
-                    humidity=reading.humidity, telemetry_context=json.dumps(evidence),
+                    humidity=reading.humidity, telemetry_context=json.dumps({
+                        "readings": evidence,
+                        "class_probabilities": result.get("class_probabilities", {}),
+                    }),
                 ))
         session.commit()
 
@@ -240,14 +253,11 @@ def get_station_history(station_id: str):
 def get_stations():
     with SessionLocal() as session:
         stations = session.scalars(select(Station).order_by(Station.station_id)).all()
-        result = []
-        for station in stations:
-            anomaly_count = session.scalar(select(__import__("sqlalchemy").func.count(Anomaly.id)).where(Anomaly.station_id == station.station_id)) or 0
-            result.append({"station_id": station.station_id, "name": station.name, "history_size": station_history.count(station.station_id), "anomaly_count": anomaly_count})
-        return {"count": len(result), "stations": result}
+        return {"count": len(stations), "stations": [{"station_id": s.station_id, "name": s.name} for s in stations]}
 
 
 @app.post("/detect")
-def detect(readings: list[WeatherReading]):
-    data = pd.DataFrame([reading.model_dump() for reading in readings])
-    return anomaly_service.detect(data)
+def detect(reading: WeatherReading):
+    history = station_history.get(reading.station_id)
+    history.append(reading.model_dump())
+    return anomaly_service.detect(pd.DataFrame(history))
