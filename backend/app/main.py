@@ -2,6 +2,7 @@ from datetime import datetime
 from pathlib import Path
 import json
 import os
+from threading import Lock
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -20,7 +21,7 @@ from app.services.station_history import StationHistory
 app = FastAPI(
     title="AeroAlert API",
     description="Intelligent anomaly detection for weather stations",
-    version="0.8.0",
+    version="0.8.1",
 )
 
 origins = ["http://localhost:3000"]
@@ -52,15 +53,35 @@ class OperatorDecision(BaseModel):
 BASE_DIR = Path(__file__).resolve().parent.parent
 TRAIN_PATH = BASE_DIR / "data" / "simulated" / "training_data.csv"
 
-print("Loading training data...")
-training_df = pd.read_csv(TRAIN_PATH)
-training_df["timestamp"] = pd.to_datetime(training_df["timestamp"], utc=True)
-training_df = create_features(training_df)
-ml_data = training_df.dropna(subset=FEATURE_COLUMNS)
-model = train_random_forest(ml_data[FEATURE_COLUMNS], ml_data["anomaly_type"])
-print("Model ready.")
+# Lazy model loading is intentional: Render needs Uvicorn to bind its port
+# quickly. Training the Random Forest during module import can delay startup
+# enough for Render's port scanner to report no open port.
+_model = None
+_anomaly_service = None
+_model_lock = Lock()
 
-anomaly_service = AnomalyService(model)
+
+def get_anomaly_service() -> AnomalyService:
+    global _model, _anomaly_service
+
+    if _anomaly_service is not None:
+        return _anomaly_service
+
+    with _model_lock:
+        if _anomaly_service is None:
+            print("Loading training data...")
+            training_df = pd.read_csv(TRAIN_PATH)
+            training_df["timestamp"] = pd.to_datetime(training_df["timestamp"], utc=True)
+            training_df = create_features(training_df)
+            ml_data = training_df.dropna(subset=FEATURE_COLUMNS)
+            print("Training Random Forest...")
+            _model = train_random_forest(ml_data[FEATURE_COLUMNS], ml_data["anomaly_type"])
+            _anomaly_service = AnomalyService(_model)
+            print("Model ready.")
+
+    return _anomaly_service
+
+
 station_history = StationHistory(max_length=48)
 connection_manager = ConnectionManager()
 Base.metadata.create_all(engine)
@@ -82,11 +103,9 @@ def anomaly_to_dict(anomaly: Anomaly):
     if anomaly.telemetry_context:
         try:
             payload = json.loads(anomaly.telemetry_context)
-            # New persisted format: {"readings": [...], "class_probabilities": {...}}
             if isinstance(payload, dict):
                 readings = payload.get("readings", [])
                 class_probabilities = payload.get("class_probabilities", {})
-            # Backward compatibility with the earlier persisted list format.
             elif isinstance(payload, list):
                 readings = payload
         except json.JSONDecodeError:
@@ -149,12 +168,22 @@ def health():
 
 @app.get("/model/feature-importance")
 def feature_importance():
-    ranked = sorted(zip(FEATURE_COLUMNS, model.feature_importances_), key=lambda item: item[1], reverse=True)
-    return {"algorithm": "Random Forest Classifier", "method": "impurity-based feature importance", "features": [{"feature": f, "importance": float(i)} for f, i in ranked]}
+    service = get_anomaly_service()
+    ranked = sorted(
+        zip(FEATURE_COLUMNS, service.model.feature_importances_),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return {
+        "algorithm": "Random Forest Classifier",
+        "method": "impurity-based feature importance",
+        "features": [{"feature": f, "importance": float(i)} for f, i in ranked],
+    }
 
 
 @app.post("/telemetry")
 async def ingest_telemetry(reading: WeatherReading):
+    anomaly_service = get_anomaly_service()
     reading_data = reading.model_dump()
     station_history.add(reading.station_id, reading_data)
     history = station_history.get(reading.station_id)
@@ -162,31 +191,67 @@ async def ingest_telemetry(reading: WeatherReading):
 
     with SessionLocal() as session:
         ensure_station(session, reading.station_id)
-        existing_reading = session.scalar(select(TelemetryReading).where(TelemetryReading.station_id == reading.station_id, TelemetryReading.timestamp == reading.timestamp))
+        existing_reading = session.scalar(
+            select(TelemetryReading).where(
+                TelemetryReading.station_id == reading.station_id,
+                TelemetryReading.timestamp == reading.timestamp,
+            )
+        )
         if existing_reading is None:
             session.add(TelemetryReading(**reading_data))
 
         if result.get("is_anomaly"):
-            existing_anomaly = session.scalar(select(Anomaly).where(Anomaly.station_id == reading.station_id, Anomaly.timestamp == reading.timestamp))
+            existing_anomaly = session.scalar(
+                select(Anomaly).where(
+                    Anomaly.station_id == reading.station_id,
+                    Anomaly.timestamp == reading.timestamp,
+                )
+            )
             if existing_anomaly is None:
-                evidence = [{
-                    "timestamp": r["timestamp"].isoformat() if isinstance(r["timestamp"], datetime) else str(r["timestamp"]),
-                    "temperature": r["temperature"], "pressure": r["pressure"], "humidity": r["humidity"]
-                } for r in history[-12:]]
-                session.add(Anomaly(
-                    station_id=reading.station_id,
-                    timestamp=reading.timestamp,
-                    type=result["type"], severity=result["severity"], confidence=float(result["confidence"]),
-                    reason=result["reason"], temperature=reading.temperature, pressure=reading.pressure,
-                    humidity=reading.humidity, telemetry_context=json.dumps({
-                        "readings": evidence,
-                        "class_probabilities": result.get("class_probabilities", {}),
-                    }),
-                ))
+                evidence = [
+                    {
+                        "timestamp": r["timestamp"].isoformat() if isinstance(r["timestamp"], datetime) else str(r["timestamp"]),
+                        "temperature": r["temperature"],
+                        "pressure": r["pressure"],
+                        "humidity": r["humidity"],
+                    }
+                    for r in history[-12:]
+                ]
+                session.add(
+                    Anomaly(
+                        station_id=reading.station_id,
+                        timestamp=reading.timestamp,
+                        type=result["type"],
+                        severity=result["severity"],
+                        confidence=float(result["confidence"]),
+                        reason=result["reason"],
+                        temperature=reading.temperature,
+                        pressure=reading.pressure,
+                        humidity=reading.humidity,
+                        telemetry_context=json.dumps({
+                            "readings": evidence,
+                            "class_probabilities": result.get("class_probabilities", {}),
+                        }),
+                    )
+                )
         session.commit()
 
-    evidence = [{"timestamp": r["timestamp"].isoformat() if isinstance(r["timestamp"], datetime) else str(r["timestamp"]), "temperature": r["temperature"], "pressure": r["pressure"], "humidity": r["humidity"]} for r in history[-12:]]
-    message = {**reading_data, "timestamp": reading.timestamp.isoformat(), "history_size": len(history), "detection": result, "telemetry_context": evidence}
+    evidence = [
+        {
+            "timestamp": r["timestamp"].isoformat() if isinstance(r["timestamp"], datetime) else str(r["timestamp"]),
+            "temperature": r["temperature"],
+            "pressure": r["pressure"],
+            "humidity": r["humidity"],
+        }
+        for r in history[-12:]
+    ]
+    message = {
+        **reading_data,
+        "timestamp": reading.timestamp.isoformat(),
+        "history_size": len(history),
+        "detection": result,
+        "telemetry_context": evidence,
+    }
     await connection_manager.broadcast(message, reading.station_id)
     return message
 
@@ -244,8 +309,22 @@ def get_operator_decision(station_id: str, timestamp: str):
 @app.get("/telemetry/{station_id}")
 def get_station_history(station_id: str):
     with SessionLocal() as session:
-        readings = session.scalars(select(TelemetryReading).where(TelemetryReading.station_id == station_id).order_by(desc(TelemetryReading.timestamp)).limit(48)).all()
-        items = [{"timestamp": r.timestamp.isoformat(), "station_id": r.station_id, "temperature": r.temperature, "pressure": r.pressure, "humidity": r.humidity} for r in reversed(readings)]
+        readings = session.scalars(
+            select(TelemetryReading)
+            .where(TelemetryReading.station_id == station_id)
+            .order_by(desc(TelemetryReading.timestamp))
+            .limit(48)
+        ).all()
+        items = [
+            {
+                "timestamp": r.timestamp.isoformat(),
+                "station_id": r.station_id,
+                "temperature": r.temperature,
+                "pressure": r.pressure,
+                "humidity": r.humidity,
+            }
+            for r in reversed(readings)
+        ]
         return {"station_id": station_id, "count": len(items), "readings": items}
 
 
@@ -258,6 +337,7 @@ def get_stations():
 
 @app.post("/detect")
 def detect(reading: WeatherReading):
+    anomaly_service = get_anomaly_service()
     history = station_history.get(reading.station_id)
     history.append(reading.model_dump())
     return anomaly_service.detect(pd.DataFrame(history))
