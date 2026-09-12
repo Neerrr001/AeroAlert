@@ -4,10 +4,10 @@ import json
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.db import Base, SessionLocal, engine
-from app.models import Anomaly, Station, TelemetryReading
+from app.models import Anomaly, Station
 from app.ml.feature_engineering import create_features
 from app.ml.random_forest import FEATURE_COLUMNS, train_random_forest
 from app.services.anomaly_service import AnomalyService
@@ -21,6 +21,8 @@ STATIONS = [
     ("DELHI_001", "Delhi AWS"),
     ("MUMBAI_001", "Mumbai AWS"),
 ]
+
+DEMO_TYPES = ["SPIKE", "FROZEN_SENSOR", "STEP_CHANGE", "DRIFT", "MISSING_DATA"]
 
 
 def build_service() -> AnomalyService:
@@ -43,30 +45,27 @@ def seed_demo(session, service):
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     station_id = STATIONS[0][0]
 
-    # Seed a compact, deterministic set of five anomalies plus their evidence.
-    for anomaly_type in ["SPIKE", "FROZEN_SENSOR", "STEP_CHANGE", "DRIFT", "MISSING_DATA"]:
-        match = df.index[df["anomaly_type"].astype(str) == anomaly_type]
-        if len(match) == 0:
+    # Re-seeding should produce exactly five deterministic demo anomalies.
+    session.execute(delete(Anomaly).where(Anomaly.station_id == station_id))
+
+    for anomaly_type in DEMO_TYPES:
+        matches = df.index[df["anomaly_type"].astype(str) == anomaly_type]
+        # Use a later event so the detector has enough clean history for
+        # rolling/24-hour features instead of returning "not enough data".
+        valid_matches = [int(i) for i in matches if int(i) >= 48]
+        if not valid_matches:
             continue
-        event_index = int(match[0])
-        start = max(0, event_index - 12)
+
+        event_index = valid_matches[0]
+        start = event_index - 48
         end = min(len(df), event_index + 1)
         context = df.iloc[start:end].copy()
         result = service.detect(context)
         row = df.iloc[event_index]
 
         timestamp = pd.Timestamp(row["timestamp"]).to_pydatetime()
-        existing = session.scalar(
-            select(Anomaly).where(
-                Anomaly.station_id == station_id,
-                Anomaly.timestamp == timestamp,
-            )
-        )
-        if existing is not None:
-            continue
-
         context_rows = []
-        for _, context_row in context.tail(12).iterrows():
+        for _, context_row in context.tail(24).iterrows():
             context_rows.append(
                 {
                     "timestamp": pd.Timestamp(context_row["timestamp"]).isoformat(),
@@ -76,14 +75,21 @@ def seed_demo(session, service):
                 }
             )
 
+        # Keep the ground-truth anomaly type, but use the detector's actual
+        # confidence/reason when it successfully evaluates the event.
+        detected = bool(result.get("is_anomaly", False))
+        severity = result.get("severity", "HIGH") if detected else "HIGH"
+        confidence = float(result.get("confidence", 0.0)) if detected else 0.0
+        reason = result.get("reason") if detected else f"Injected {anomaly_type} demonstration event."
+
         session.add(
             Anomaly(
                 station_id=station_id,
                 timestamp=timestamp,
                 type=anomaly_type,
-                severity=result.get("severity", "HIGH"),
-                confidence=float(result.get("confidence", 0.0)),
-                reason=result.get("reason", f"Injected {anomaly_type} demonstration event."),
+                severity=severity,
+                confidence=confidence,
+                reason=reason,
                 temperature=None if pd.isna(row["temperature"]) else float(row["temperature"]),
                 pressure=None if pd.isna(row["pressure"]) else float(row["pressure"]),
                 humidity=None if pd.isna(row["humidity"]) else float(row["humidity"]),
