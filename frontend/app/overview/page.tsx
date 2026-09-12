@@ -22,14 +22,30 @@ type Detection = {
   reason: string;
 };
 
-type TelemetryMessage = {
+type TelemetryReading = {
   station_id: string;
   timestamp: string;
   temperature: number | null;
   pressure: number | null;
   humidity: number | null;
+};
+
+type TelemetryMessage = TelemetryReading & {
   history_size: number;
   detection: Detection;
+};
+
+type PersistedAnomaly = {
+  id?: number;
+  station_id: string;
+  timestamp: string;
+  type: string;
+  severity: string;
+  confidence: number;
+  reason: string;
+  temperature: number | null;
+  pressure: number | null;
+  humidity: number | null;
 };
 
 type ConnectionStatus = "connecting" | "live" | "reconnecting";
@@ -63,9 +79,32 @@ function stateClasses(detection: Detection | null) {
     : "border-amber-500/30 bg-amber-500/10 text-amber-300";
 }
 
+function toNormalDetection(reason = "Persisted station telemetry; no live decision was attached to this historical reading."): Detection {
+  return {
+    is_anomaly: false,
+    type: "NORMAL",
+    severity: "LOW",
+    confidence: 0,
+    reason,
+  };
+}
+
+function hasCompleteTelemetry(reading: TelemetryReading) {
+  return (
+    reading.temperature != null &&
+    reading.pressure != null &&
+    reading.humidity != null &&
+    Number.isFinite(reading.temperature) &&
+    Number.isFinite(reading.pressure) &&
+    Number.isFinite(reading.humidity)
+  );
+}
+
 export default function OverviewPage() {
   const [latest, setLatest] = useState<TelemetryMessage | null>(null);
   const [history, setHistory] = useState<TelemetryMessage[]>([]);
+  const [latestDecision, setLatestDecision] = useState<Detection | null>(null);
+  const [latestDecisionTime, setLatestDecisionTime] = useState<string | null>(null);
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const [error, setError] = useState<string | null>(null);
 
@@ -75,23 +114,61 @@ export default function OverviewPage() {
     let socket: WebSocket | null = null;
     let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
 
-    const loadHistory = async () => {
+    const loadPersistedData = async () => {
       try {
-        const response = await fetch(`${API_BASE}/telemetry/${STATION_ID}`, { cache: "no-store" });
-        if (!response.ok) throw new Error(`History request failed (${response.status})`);
-        const data = await response.json();
-        const readings: TelemetryMessage[] = (data.readings ?? []).map((reading: any) => ({
+        const [telemetryResponse, anomaliesResponse] = await Promise.all([
+          fetch(`${API_BASE}/telemetry/${STATION_ID}`, { cache: "no-store" }),
+          fetch(`${API_BASE}/anomalies?station_id=${encodeURIComponent(STATION_ID)}`, { cache: "no-store" }),
+        ]);
+
+        if (!telemetryResponse.ok) throw new Error(`Telemetry request failed (${telemetryResponse.status})`);
+        if (!anomaliesResponse.ok) throw new Error(`Anomaly request failed (${anomaliesResponse.status})`);
+
+        const telemetryData = (await telemetryResponse.json()) as {
+          count?: number;
+          readings?: TelemetryReading[];
+        };
+        const anomalyData = (await anomaliesResponse.json()) as {
+          anomalies?: PersistedAnomaly[];
+        };
+
+        const persistedReadings = telemetryData.readings ?? [];
+        const historySize = telemetryData.count ?? persistedReadings.length;
+        const normalizedHistory: TelemetryMessage[] = persistedReadings.map((reading) => ({
           ...reading,
-          history_size: data.count ?? 0,
-          detection: {
-            is_anomaly: false,
-            type: "HISTORICAL",
-            severity: "LOW",
-            confidence: 0,
-            reason: "Historical reading; no live detection was stored with this reading.",
-          },
+          history_size: historySize,
+          detection: toNormalDetection(),
         }));
-        if (!cancelled) setHistory(readings.reverse().slice(0, 30));
+
+        const newestFirst = [...normalizedHistory].reverse();
+        const newestUsable = newestFirst.find(hasCompleteTelemetry) ?? newestFirst[0] ?? null;
+        const anomalies = [...(anomalyData.anomalies ?? [])].sort(
+          (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+        );
+        const newestAnomaly = anomalies[0] ?? null;
+
+        if (!cancelled) {
+          setHistory(newestFirst.slice(0, 30));
+          if (newestUsable) {
+            setLatest({
+              ...newestUsable,
+              history_size: historySize,
+              detection: toNormalDetection(
+                "Latest usable persisted telemetry. Historical anomaly decisions are shown separately below."
+              ),
+            });
+          }
+          if (newestAnomaly) {
+            setLatestDecision({
+              is_anomaly: true,
+              type: newestAnomaly.type,
+              severity: newestAnomaly.severity,
+              confidence: newestAnomaly.confidence,
+              reason: newestAnomaly.reason,
+            });
+            setLatestDecisionTime(newestAnomaly.timestamp);
+          }
+        }
       } catch {
         if (!cancelled) setError("Waiting for the AeroAlert backend.");
       }
@@ -115,6 +192,8 @@ export default function OverviewPage() {
         try {
           const message = JSON.parse(event.data) as TelemetryMessage;
           setLatest(message);
+          setLatestDecision(message.detection);
+          setLatestDecisionTime(message.timestamp);
           setHistory((current) => [
             message,
             ...current.filter((item) => item.timestamp !== message.timestamp),
@@ -125,7 +204,7 @@ export default function OverviewPage() {
       };
 
       socket.onerror = () => {
-        if (!cancelled) setError("Live telemetry connection failed.");
+        if (!cancelled) setError("Live telemetry connection failed. Persisted data is still available.");
       };
 
       socket.onclose = () => {
@@ -138,7 +217,7 @@ export default function OverviewPage() {
       };
     };
 
-    loadHistory();
+    loadPersistedData();
     connect();
 
     return () => {
@@ -149,8 +228,8 @@ export default function OverviewPage() {
     };
   }, []);
 
-  const previous = history[1];
-  const detection = latest?.detection ?? null;
+  const previous = history.find((reading) => reading.timestamp !== latest?.timestamp);
+  const detection = latestDecision;
   const anomalyReadings = useMemo(
     () => history.filter((reading) => reading.detection?.is_anomaly),
     [history]
@@ -164,9 +243,7 @@ export default function OverviewPage() {
             <Activity className="h-3.5 w-3.5" /> Live prototype monitoring
           </div>
           <h1 className="mt-2 text-xl font-bold text-slate-100 font-mono uppercase">Operational Dashboard</h1>
-          <p className="mt-1 text-xs text-slate-400">
-            Real-time telemetry and anomaly decisions for {STATION_ID}
-          </p>
+          <p className="mt-1 text-xs text-slate-400">Real-time telemetry and anomaly decisions for {STATION_ID}</p>
         </div>
         <span className={`inline-flex w-fit items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-mono ${connection === "live" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400" : "border-slate-700 bg-slate-900 text-slate-400"}`}>
           {connection === "live" ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
@@ -175,42 +252,37 @@ export default function OverviewPage() {
       </div>
 
       {error && (
-        <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-xs text-amber-200">
-          {error}
-        </div>
+        <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-xs text-amber-200">{error}</div>
       )}
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="p-4 bg-slate-900/60 border border-slate-800 rounded-lg space-y-2">
-          <div className="flex items-center justify-between text-xs text-slate-400"><span>Temperature</span><Thermometer className="w-4 h-4 text-slate-500" /></div>
-          <div className="flex items-end justify-between"><div className="text-2xl font-bold font-mono text-slate-100">{formatNumber(latest?.temperature)}<span className="ml-1 text-sm text-slate-500">°C</span></div><span className="text-[11px] text-slate-500 font-mono">Δ {delta(latest?.temperature, previous?.temperature)}</span></div>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="space-y-2 rounded-lg border border-slate-800 bg-slate-900/60 p-4">
+          <div className="flex items-center justify-between text-xs text-slate-400"><span>Temperature</span><Thermometer className="h-4 w-4 text-slate-500" /></div>
+          <div className="flex items-end justify-between"><div className="text-2xl font-bold font-mono text-slate-100">{formatNumber(latest?.temperature)}<span className="ml-1 text-sm text-slate-500">°C</span></div><span className="text-[11px] font-mono text-slate-500">Δ {delta(latest?.temperature, previous?.temperature)}</span></div>
         </div>
 
-        <div className="p-4 bg-slate-900/60 border border-slate-800 rounded-lg space-y-2">
-          <div className="flex items-center justify-between text-xs text-slate-400"><span>Relative Humidity</span><Droplets className="w-4 h-4 text-slate-500" /></div>
-          <div className="flex items-end justify-between"><div className="text-2xl font-bold font-mono text-slate-100">{formatNumber(latest?.humidity)}<span className="ml-1 text-sm text-slate-500">%</span></div><span className="text-[11px] text-slate-500 font-mono">Δ {delta(latest?.humidity, previous?.humidity)}</span></div>
+        <div className="space-y-2 rounded-lg border border-slate-800 bg-slate-900/60 p-4">
+          <div className="flex items-center justify-between text-xs text-slate-400"><span>Relative Humidity</span><Droplets className="h-4 w-4 text-slate-500" /></div>
+          <div className="flex items-end justify-between"><div className="text-2xl font-bold font-mono text-slate-100">{formatNumber(latest?.humidity)}<span className="ml-1 text-sm text-slate-500">%</span></div><span className="text-[11px] font-mono text-slate-500">Δ {delta(latest?.humidity, previous?.humidity)}</span></div>
         </div>
 
-        <div className="p-4 bg-slate-900/60 border border-slate-800 rounded-lg space-y-2">
-          <div className="flex items-center justify-between text-xs text-slate-400"><span>Atmospheric Pressure</span><Gauge className="w-4 h-4 text-slate-500" /></div>
-          <div className="flex items-end justify-between"><div className="text-2xl font-bold font-mono text-slate-100">{formatNumber(latest?.pressure)}<span className="ml-1 text-sm text-slate-500">hPa</span></div><span className="text-[11px] text-slate-500 font-mono">Δ {delta(latest?.pressure, previous?.pressure)}</span></div>
+        <div className="space-y-2 rounded-lg border border-slate-800 bg-slate-900/60 p-4">
+          <div className="flex items-center justify-between text-xs text-slate-400"><span>Atmospheric Pressure</span><Gauge className="h-4 w-4 text-slate-500" /></div>
+          <div className="flex items-end justify-between"><div className="text-2xl font-bold font-mono text-slate-100">{formatNumber(latest?.pressure)}<span className="ml-1 text-sm text-slate-500">hPa</span></div><span className="text-[11px] font-mono text-slate-500">Δ {delta(latest?.pressure, previous?.pressure)}</span></div>
         </div>
 
-        <div className={`p-4 border rounded-lg space-y-2 ${stateClasses(detection)}`}>
-          <div className="flex items-center justify-between text-xs"><span>Current Station State</span>{detection?.is_anomaly ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}</div>
+        <div className={`space-y-2 rounded-lg border p-4 ${stateClasses(detection)}`}>
+          <div className="flex items-center justify-between text-xs"><span>Current Station State</span>{detection?.is_anomaly ? <AlertTriangle className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />}</div>
           <div className="text-2xl font-bold font-mono">{detection ? (detection.is_anomaly ? detection.type : "NORMAL") : "WAITING"}</div>
           <p className="text-[11px] font-mono opacity-75">{detection ? `${(detection.confidence * 100).toFixed(1)}% model confidence` : "No decision yet"}</p>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2 p-5 bg-slate-900/40 border border-slate-800 rounded-lg space-y-4">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+        <div className="space-y-4 rounded-lg border border-slate-800 bg-slate-900/40 p-5 lg:col-span-2">
           <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-            <div>
-              <h2 className="text-sm font-bold font-mono uppercase text-slate-200">Live Telemetry</h2>
-              <p className="mt-1 text-[11px] text-slate-500">Latest observations received from the prototype feed</p>
-            </div>
-            <Radio className="w-4 h-4 text-emerald-400" />
+            <div><h2 className="text-sm font-bold font-mono uppercase text-slate-200">Live Telemetry</h2><p className="mt-1 text-[11px] text-slate-500">Persisted observations plus the live prototype feed</p></div>
+            <Radio className="h-4 w-4 text-emerald-400" />
           </div>
 
           <div className="grid grid-cols-3 gap-3">
@@ -238,40 +310,37 @@ export default function OverviewPage() {
           </div>
         </div>
 
-        <div className="p-5 bg-slate-900/40 border border-slate-800 rounded-lg space-y-4">
-          <div className="flex items-center justify-between border-b border-slate-800 pb-3"><h2 className="text-sm font-bold font-mono uppercase text-slate-200">Latest Decision</h2><Clock className="w-4 h-4 text-slate-500" /></div>
+        <div className="space-y-4 rounded-lg border border-slate-800 bg-slate-900/40 p-5">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-3"><div><h2 className="text-sm font-bold font-mono uppercase text-slate-200">Latest Decision</h2><p className="mt-1 text-[11px] text-slate-500">Most recent persisted anomaly decision</p></div><Clock className="h-4 w-4 text-slate-500" /></div>
           {detection ? (
             <>
               <div className={`rounded-lg border p-4 ${stateClasses(detection)}`}>
                 <div className="text-[10px] uppercase tracking-widest opacity-70">Detection</div>
                 <div className="mt-2 text-xl font-bold font-mono">{detection.is_anomaly ? detection.type : "NORMAL"}</div>
                 <div className="mt-1 text-xs opacity-75">Severity: {detection.severity}</div>
+                {latestDecisionTime && <div className="mt-1 text-[11px] opacity-60">{formatTime(latestDecisionTime)}</div>}
               </div>
               <div>
                 <div className="text-[10px] uppercase tracking-widest text-slate-500">Confidence</div>
-                <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden"><div className="h-full bg-emerald-400" style={{ width: `${Math.min(100, Math.max(0, detection.confidence * 100))}%` }} /></div>
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-800"><div className="h-full bg-emerald-400" style={{ width: `${Math.min(100, Math.max(0, detection.confidence * 100))}%` }} /></div>
                 <div className="mt-2 font-mono text-sm text-slate-200">{(detection.confidence * 100).toFixed(1)}%</div>
               </div>
               <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-4"><div className="text-[10px] uppercase tracking-widest text-slate-500">Reason</div><p className="mt-2 text-xs leading-relaxed text-slate-300">{detection.reason}</p></div>
             </>
           ) : (
-            <div className="flex min-h-44 items-center justify-center text-sm text-slate-500">Waiting for the first live decision…</div>
+            <div className="flex min-h-44 items-center justify-center text-sm text-slate-500">Waiting for a persisted decision…</div>
           )}
         </div>
       </div>
 
-      <div className="p-5 bg-slate-900/40 border border-slate-800 rounded-lg">
-        <div className="flex items-center gap-2"><Activity className="w-4 h-4 text-emerald-400" /><h2 className="text-sm font-bold font-mono uppercase text-slate-200">System Status</h2></div>
-        <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs font-mono">
-          <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-3"><span className="text-slate-400">Telemetry stream</span><span className={connection === "live" ? "text-emerald-400" : "text-slate-500"}>{connection === "live" ? "READY" : "WAITING"}</span></div>
-          <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-3"><span className="text-slate-400">Anomaly engine</span><span className={latest ? "text-emerald-400" : "text-slate-500"}>{latest ? "READY" : "WAITING"}</span></div>
-          <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-3"><span className="text-slate-400">Recent live anomalies</span><span className={anomalyReadings.length ? "text-amber-400" : "text-emerald-400"}>{anomalyReadings.length}</span></div>
+      <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-5">
+        <div className="flex items-center gap-2"><Activity className="h-4 w-4 text-emerald-400" /><h2 className="text-sm font-bold font-mono uppercase text-slate-200">System Status</h2></div>
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-4"><div className="text-[10px] uppercase tracking-widest text-slate-500">Backend</div><div className="mt-2 text-sm font-mono text-emerald-400">{connection === "live" ? "ONLINE" : "CONNECTING"}</div></div>
+          <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-4"><div className="text-[10px] uppercase tracking-widest text-slate-500">Persisted Telemetry</div><div className="mt-2 text-sm font-mono text-slate-200">{history.length > 0 ? "AVAILABLE" : "WAITING"}</div></div>
+          <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-4"><div className="text-[10px] uppercase tracking-widest text-slate-500">Anomaly Records</div><div className="mt-2 text-sm font-mono text-slate-200">{detection?.is_anomaly ? "ACTIVE" : anomalyReadings.length > 0 ? "DETECTED" : "READY"}</div></div>
         </div>
       </div>
-
-      <p className="text-[11px] leading-relaxed text-slate-600">
-        Prototype source: simulated {STATION_ID} telemetry. This dashboard does not represent a nationwide live IMD deployment.
-      </p>
     </div>
   );
 }
