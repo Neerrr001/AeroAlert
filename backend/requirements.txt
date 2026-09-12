@@ -5,3 +5,4 @@ scikit-learn
 requests
 sqlalchemy
 psycopg[binary]
+python-dotenv
