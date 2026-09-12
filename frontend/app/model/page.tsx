@@ -23,9 +23,11 @@ function MetricCard({ title, value, description, icon: Icon, emphasis = false }:
 export default function ModelMetricsPage() {
   const [features, setFeatures] = useState<Feature[]>([]);
   const [featureError, setFeatureError] = useState(false);
+  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+
   useEffect(() => {
-    fetch("http://localhost:8000/model/feature-importance", { cache: "no-store" }).then((response) => { if (!response.ok) throw new Error(); return response.json(); }).then((data) => setFeatures(data.features ?? [])).catch(() => setFeatureError(true));
-  }, []);
+    fetch(`${API_BASE}/model/feature-importance`, { cache: "no-store" }).then((response) => { if (!response.ok) throw new Error(); return response.json(); }).then((data) => setFeatures(data.features ?? [])).catch(() => setFeatureError(true));
+  }, [API_BASE]);
   const maxImportance = features[0]?.importance ?? 1;
 
   return <div className="space-y-6">
