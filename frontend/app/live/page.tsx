@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Droplets,
   Gauge,
+  LucideIcon,
   Radio,
   Thermometer,
   Wifi,
@@ -43,6 +44,13 @@ type HistoryResponse = {
 };
 
 type ConnectionStatus = "connecting" | "live" | "reconnecting";
+
+type Metric = {
+  label: string;
+  value: number | null;
+  unit: string;
+  Icon: LucideIcon;
+};
 
 const STATION_ID = "LUCKNOW_001";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -156,16 +164,11 @@ export default function LiveTelemetryPage() {
 
   const detection = latest?.detection;
 
-  const metrics: Array<{
-    label: string;
-    value: number | null;
-    unit: string;
-    Icon: typeof Thermometer;
-  }> = [
-    ["Temperature", latest?.temperature ?? null, "°C", Thermometer],
-    ["Relative Humidity", latest?.humidity ?? null, "%", Droplets],
-    ["Pressure", latest?.pressure ?? null, "hPa", Gauge],
-  ].map(([label, value, unit, Icon]) => ({ label, value, unit, Icon }));
+  const metrics: Metric[] = [
+    { label: "Temperature", value: latest?.temperature ?? null, unit: "°C", Icon: Thermometer },
+    { label: "Relative Humidity", value: latest?.humidity ?? null, unit: "%", Icon: Droplets },
+    { label: "Pressure", value: latest?.pressure ?? null, unit: "hPa", Icon: Gauge },
+  ];
 
   return (
     <div className="space-y-6">
